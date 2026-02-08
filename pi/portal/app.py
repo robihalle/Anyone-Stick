@@ -1,8 +1,13 @@
 from flask import Flask, request, jsonify, render_template_string, redirect
-import subprocess, time
+import json, subprocess, time
 
 app = Flask(__name__)
 stats = {"rx": 0, "tx": 0, "time": 0, "speed_rx": 0, "speed_tx": 0}
+CIRCUIT_CONFIG_PATH = "/etc/anyone-circuit.json"
+DEFAULT_CIRCUIT_CONFIG = {
+    "exit_country": "auto",
+    "notes": "Managed by portal; SDK integration pending."
+}
 
 def update_stats():
     global stats
@@ -19,6 +24,17 @@ def update_stats():
                     stats.update({"rx": curr_rx, "tx": curr_tx, "time": curr_t})
     except: pass
     return stats
+
+def load_circuit_config():
+    try:
+        with open(CIRCUIT_CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return DEFAULT_CIRCUIT_CONFIG.copy()
+
+def save_circuit_config(cfg):
+    with open(CIRCUIT_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 HTML = """
 <!DOCTYPE html>
@@ -47,6 +63,8 @@ HTML = """
     .wifi-item { padding: 12px; border-bottom: 1px solid var(--border); cursor: pointer; display: flex; justify-content: space-between; font-size: 14px; }
     .connected-label { color: var(--secondary); font-weight: 800; font-size: 10px; border: 1px solid var(--secondary); padding: 2px 6px; border-radius: 4px; }
     input { width: 100%; padding: 14px; background: #0d1117; border: 1px solid var(--border); border-radius: 8px; color: #fff; margin: 10px 0; box-sizing: border-box; }
+    select { width: 100%; padding: 14px; background: #0d1117; border: 1px solid var(--border); border-radius: 8px; color: #fff; margin: 10px 0; box-sizing: border-box; }
+    .helper { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -74,9 +92,33 @@ HTML = """
             <button id="conn-btn" class="btn-primary" onclick="connect()">Connect Now</button>
         </div>
     </div>
+    <div class="card">
+        <h3>Anyone Circuit</h3>
+        <label for="exit-country" style="font-size:12px; color:var(--text-dim)">Exit Country</label>
+        <select id="exit-country">
+            <option value="auto">Auto (best available)</option>
+            <option value="de">Germany</option>
+            <option value="nl">Netherlands</option>
+            <option value="ch">Switzerland</option>
+            <option value="us">United States</option>
+            <option value="gb">United Kingdom</option>
+            <option value="fr">France</option>
+            <option value="se">Sweden</option>
+            <option value="no">Norway</option>
+            <option value="es">Spain</option>
+        </select>
+        <button id="circuit-btn" class="btn-primary" onclick="saveCircuit()">Apply Circuit Settings</button>
+        <div class="helper">Settings are stored locally and should be applied by the Anyone SDK integration.</div>
+    </div>
 </div>
 <script>
 let targetSSID = "";
+const circuitConfig = {{ circuit | tojson }};
+document.addEventListener('DOMContentLoaded', () => {
+    if (circuitConfig.exit_country) {
+        document.getElementById('exit-country').value = circuitConfig.exit_country;
+    }
+});
 async function updateTraffic(){
     try {
         const res = await fetch('/api/traffic'); const d = await res.json();
@@ -121,12 +163,35 @@ async function connect(){
     } catch(e) { alert("Error connecting"); }
     finally { btn.disabled = false; btn.innerText = "Connect Now"; }
 }
+
+async function saveCircuit(){
+    const btn = document.getElementById('circuit-btn');
+    const exitCountry = document.getElementById('exit-country').value;
+    btn.disabled = true; btn.innerText = "Saving...";
+    try {
+        const res = await fetch('/api/circuit', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({exit_country: exitCountry})
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            alert(data.status || "Error saving settings");
+            return;
+        }
+        alert("Circuit settings saved");
+    } catch (e) {
+        alert("Error saving settings");
+    } finally {
+        btn.disabled = false; btn.innerText = "Apply Circuit Settings";
+    }
+}
 </script></body></html>
 """
 @app.route('/')
 def index():
     p = subprocess.run("sudo iptables -t nat -L PREROUTING -n | grep 9040", shell=True, capture_output=True).returncode == 0
-    return render_template_string(HTML, privacy=p)
+    return render_template_string(HTML, privacy=p, circuit=load_circuit_config())
 
 @app.route('/api/traffic')
 def traffic(): return jsonify(update_stats())
@@ -154,6 +219,20 @@ def w_conn():
     subprocess.run(["sudo", "nmcli", "con", "delete", ssid], capture_output=True)
     res = subprocess.run(["sudo", "nmcli", "dev", "wifi", "connect", ssid, "password", d.get('password')], capture_output=True, text=True)
     return jsonify({"status": "Connected!" if res.returncode==0 else res.stderr.strip()})
+
+@app.route('/api/circuit', methods=['GET', 'POST'])
+def circuit_config():
+    if request.method == 'GET':
+        return jsonify(load_circuit_config())
+    data = request.json or {}
+    exit_country = (data.get("exit_country") or "auto").lower()
+    allowed = {"auto", "de", "nl", "ch", "us", "gb", "fr", "se", "no", "es"}
+    if exit_country not in allowed:
+        return jsonify({"status": "Invalid country code"}), 400
+    cfg = load_circuit_config()
+    cfg["exit_country"] = exit_country
+    save_circuit_config(cfg)
+    return jsonify({"status": "Saved", "config": cfg})
 
 @app.route('/mode/privacy', methods=['POST'])
 def mode_p():
