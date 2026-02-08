@@ -108,16 +108,22 @@ HTML = """
             <option value="es">Spain</option>
         </select>
         <button id="circuit-btn" class="btn-primary" onclick="saveCircuit()">Apply Circuit Settings</button>
-        <div class="helper">Settings are stored locally and should be applied by the Anyone SDK integration.</div>
+        <div class="helper" id="circuit-helper">Changes apply immediately in Privacy Mode.</div>
     </div>
 </div>
 <script>
 let targetSSID = "";
 const circuitConfig = {{ circuit | tojson }};
+const privacyActive = {{ 'true' if privacy else 'false' }};
 document.addEventListener('DOMContentLoaded', () => {
     if (circuitConfig.exit_country) {
         document.getElementById('exit-country').value = circuitConfig.exit_country;
     }
+    const exitCountrySelect = document.getElementById('exit-country');
+    if (!privacyActive) {
+        document.getElementById('circuit-helper').innerText = "Enable Privacy Mode to apply changes.";
+    }
+    exitCountrySelect.addEventListener('change', () => saveCircuit());
 });
 async function updateTraffic(){
     try {
@@ -167,6 +173,10 @@ async function connect(){
 async function saveCircuit(){
     const btn = document.getElementById('circuit-btn');
     const exitCountry = document.getElementById('exit-country').value;
+    if (!privacyActive) {
+        alert("Enable Privacy Mode to apply circuit changes.");
+        return;
+    }
     btn.disabled = true; btn.innerText = "Saving...";
     try {
         const res = await fetch('/api/circuit', {
