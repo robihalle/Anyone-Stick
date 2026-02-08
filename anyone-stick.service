@@ -1,0 +1,9 @@
+[Unit]
+Description=Anyone Stick Master
+After=network.target
+[Service]
+ExecStart=/usr/local/bin/start_anyone_stack.sh
+Restart=always
+User=root
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+SocksPort 9050
+ControlPort 9051
+DNSPort 0.0.0.0:9053
+TransPort 0.0.0.0:9040
+User root
+DataDirectory /root/.anon
+AgreeToTerms 1
+AutomapHostsOnResolve 1
+VirtualAddrNetworkIPv4 10.192.0.0/10
