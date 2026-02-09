@@ -1,9 +1,15 @@
 SocksPort 9050
-ControlPort 9051
 DNSPort 0.0.0.0:9053
 TransPort 0.0.0.0:9040
-User root
+
+# ControlPort – needed by the web portal to query status & circuits
+ControlPort 9051
+CookieAuthentication 1
+CookieAuthFile /root/.anon/control_auth_cookie
+
 DataDirectory /root/.anon
 AgreeToTerms 1
 AutomapHostsOnResolve 1
 VirtualAddrNetworkIPv4 10.192.0.0/10
+
+Log notice file /var/log/anon/notices.log
