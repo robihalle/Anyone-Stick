@@ -1,15 +1,74 @@
+## ============================================================
+## Anyone Stick – anonrc (optimiert für Raspberry Pi Zero 2 W)
+## ============================================================
+
+## ----- Netzwerk-Ports ----------------------------------------
 SocksPort 9050
+ControlPort 9051
+CookieAuthentication 1
 DNSPort 0.0.0.0:9053
 TransPort 0.0.0.0:9040
 
-# ControlPort – needed by the web portal to query status & circuits
-ControlPort 9051
-CookieAuthentication 1
-CookieAuthFile /root/.anon/control_auth_cookie
-
-DataDirectory /root/.anon
-AgreeToTerms 1
+## ----- Virtuelle Adressen / DNS ------------------------------
 AutomapHostsOnResolve 1
 VirtualAddrNetworkIPv4 10.192.0.0/10
 
-Log notice file /var/log/anon/notices.log
+## ----- Speicher / RAM (Pi Zero 2 = 512 MB) -------------------
+## Queue-Speicher auf 128 MB begrenzen – verhindert OOM-Kills
+MaxMemInQueues 128 MBytes
+
+## Kernel-Socket-Buffer reduzieren – spart RAM
+ConstrainedSockets 1
+ConstrainedSockSize 4096
+
+## ----- Conflux (Traffic Splitting) ---------------------------
+## Splittet Traffic über mehrere Circuits für bessere Performance
+ConfluxEnabled 1
+## latency_lowmem: niedrige Latenz bei minimalem RAM-Verbrauch
+ConfluxClientUX latency_lowmem
+
+## ----- Crypto-Beschleunigung ---------------------------------
+## ARM Crypto Extensions des BCM2710A1 nutzen
+HardwareAccel 1
+
+## ----- Circuit-Timeouts --------------------------------------
+## Etwas großzügiger für den langsameren Pi Zero 2
+CircuitBuildTimeout 90
+LearnCircuitBuildTimeout 1
+## Streams 60 s auf ein Circuit warten lassen
+CircuitStreamTimeout 60
+## Circuits 10 Min. wiederverwenden (Standard)
+MaxCircuitDirtiness 600
+
+## ----- Dormant Mode (Stromsparen) ----------------------------
+## Bei Inaktivität in den Schlafmodus wechseln
+DormantClientTimeout 1800
+## Beim Neustart nicht automatisch aufwachen
+DormantCanceledByStartup 0
+
+## ----- Verbindungslimits -------------------------------------
+## Offene Dateideskriptoren begrenzen (Pi-freundlich)
+ConnLimit 500
+## Maximal 24 gleichzeitige Circuits im Aufbau
+MaxClientCircuitsPending 24
+
+## ----- Keepalive ---------------------------------------------
+## Verbindungen alle 2 Min. am Leben halten
+KeepalivePeriod 120
+
+## ----- Bandbreite (optional, auskommentiert) -----------------
+## Bei Bedarf aktivieren, um den Pi nicht zu überlasten
+# BandwidthRate 1 MBytes
+# BandwidthBurst 2 MBytes
+
+## ----- Vanguards (Guard-Schutz) ------------------------------
+## Schützt vor Guard-Discovery-Angriffen
+VanguardsLiteEnabled 1
+
+## ----- Logging -----------------------------------------------
+## Nur Warnungen und Fehler loggen – spart I/O auf der SD-Karte
+Log notice stderr
+
+## ----- Sicherheit --------------------------------------------
+## Keine Relay-Funktionalität – reiner Client-Modus
+ClientOnly 1
