@@ -285,11 +285,15 @@ ip addr flush dev usb0 2>/dev/null
 ip addr add 192.168.7.1/24 dev usb0
 ip link set usb0 up
 
-# WLAN aktivieren (im Hintergrund, blockiert nicht)
-nmcli con up "Stick-Gateway" &
+# Kurz warten bis IP wirklich gebunden ist
+sleep 1
 
-# DHCP sofort starten, damit der Host eine IP bekommt
+# DHCP starten – dnsmasq bindet sich dynamisch an usb0
 systemctl restart dnsmasq
+
+# Warten bis dnsmasq läuft, dann WLAN im Hintergrund
+sleep 1
+nmcli con up "Stick-Gateway" &
 
 # Portal sofort starten
 python3 /home/pi/portal/app.py &
@@ -309,10 +313,12 @@ log "start_anyone_stack.sh installiert"
 # ── 13. dnsmasq konfigurieren ───────────────────────────────────────────
 cat > /etc/dnsmasq.d/usb0.conf << 'EOF'
 interface=usb0
-bind-interfaces
+bind-dynamic
 dhcp-range=192.168.7.2,192.168.7.20,255.255.255.0,24h
 dhcp-option=3,192.168.7.1
 dhcp-option=6,192.168.7.1
+dhcp-authoritative
+leasefile-ro
 EOF
 log "dnsmasq konfiguriert für usb0 (192.168.7.0/24)"
 
