@@ -3,72 +3,58 @@
 ## ============================================================
 
 ## ----- Network Ports -----------------------------------------
-SocksPort 9050
+SocksPort 9050 IsolateDestAddr IsolateDestPort
 ControlPort 9051
 CookieAuthentication 1
-DNSPort 0.0.0.0:9053
+DNSPort 0.0.0.0:9053 IsolateDestAddr
 TransPort 0.0.0.0:9040
+
+## ----- DNS Leak Protection -----------------------------------
+ClientDNSRejectInternalAddresses 1
 
 ## ----- Virtual Addresses / DNS -------------------------------
 AutomapHostsOnResolve 1
 VirtualAddrNetworkIPv4 10.192.0.0/10
 
 ## ----- Memory / RAM (Pi Zero 2 = 512 MB) ---------------------
-## Cap queue memory at 128 MB to prevent OOM kills
 MaxMemInQueues 128 MBytes
-
-## Shrink kernel socket buffers to save RAM
 ConstrainedSockets 1
 ConstrainedSockSize 4096
 
 ## ----- Conflux (Traffic Splitting) ---------------------------
-## Split traffic across multiple circuits for better performance
 ConfluxEnabled 1
-## Low latency with minimal memory footprint
 ConfluxClientUX latency_lowmem
 
 ## ----- Hardware Crypto Acceleration --------------------------
-## Leverage ARM Crypto Extensions on the BCM2710A1
 HardwareAccel 1
 
-## ----- Circuit Timeouts --------------------------------------
-## Allow more time for the slower Pi Zero 2
+## ----- Circuit Timeouts & Rotation ---------------------------
 CircuitBuildTimeout 90
 LearnCircuitBuildTimeout 1
-## Let streams wait up to 60 s for a suitable circuit
 CircuitStreamTimeout 60
-## Reuse circuits for up to 10 min (default)
-MaxCircuitDirtiness 600
+## Circuit rotation: default 5 min (configurable via UI)
+MaxCircuitDirtiness 300
+NewCircuitPeriod 15
+
+## ----- Subnet Isolation (Anti-Correlation) -------------------
+EnforceDistinctSubnets 1
 
 ## ----- Dormant Mode (Power Saving) ---------------------------
-## Enter sleep mode after 30 min of inactivity
 DormantClientTimeout 1800
-## Do not wake up automatically on restart
 DormantCanceledByStartup 0
 
 ## ----- Connection Limits -------------------------------------
-## Keep file descriptor usage low (Pi-friendly)
 ConnLimit 500
-## Cap concurrent circuit builds
 MaxClientCircuitsPending 24
 
 ## ----- Keepalive ---------------------------------------------
-## Send keepalive every 2 min to keep connections alive
 KeepalivePeriod 120
 
-## ----- Bandwidth (optional, uncomment if needed) -------------
-## Uncomment to throttle throughput and reduce CPU load
-# BandwidthRate 1 MBytes
-# BandwidthBurst 2 MBytes
-
 ## ----- Guard Protection --------------------------------------
-## Protect against guard discovery attacks
 VanguardsLiteEnabled 1
 
 ## ----- Logging -----------------------------------------------
-## Log warnings and above only – reduces SD card I/O
 Log notice stderr
 
 ## ----- Security ----------------------------------------------
-## Pure client mode – never act as a relay
 ClientOnly 1
