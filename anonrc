@@ -1,74 +1,74 @@
 ## ============================================================
-## Anyone Stick – anonrc (optimiert für Raspberry Pi Zero 2 W)
+## Anyone Stick – anonrc (optimized for Raspberry Pi Zero 2 W)
 ## ============================================================
 
-## ----- Netzwerk-Ports ----------------------------------------
+## ----- Network Ports -----------------------------------------
 SocksPort 9050
 ControlPort 9051
 CookieAuthentication 1
 DNSPort 0.0.0.0:9053
 TransPort 0.0.0.0:9040
 
-## ----- Virtuelle Adressen / DNS ------------------------------
+## ----- Virtual Addresses / DNS -------------------------------
 AutomapHostsOnResolve 1
 VirtualAddrNetworkIPv4 10.192.0.0/10
 
-## ----- Speicher / RAM (Pi Zero 2 = 512 MB) -------------------
-## Queue-Speicher auf 128 MB begrenzen – verhindert OOM-Kills
+## ----- Memory / RAM (Pi Zero 2 = 512 MB) ---------------------
+## Cap queue memory at 128 MB to prevent OOM kills
 MaxMemInQueues 128 MBytes
 
-## Kernel-Socket-Buffer reduzieren – spart RAM
+## Shrink kernel socket buffers to save RAM
 ConstrainedSockets 1
 ConstrainedSockSize 4096
 
 ## ----- Conflux (Traffic Splitting) ---------------------------
-## Splittet Traffic über mehrere Circuits für bessere Performance
+## Split traffic across multiple circuits for better performance
 ConfluxEnabled 1
-## latency_lowmem: niedrige Latenz bei minimalem RAM-Verbrauch
+## Low latency with minimal memory footprint
 ConfluxClientUX latency_lowmem
 
-## ----- Crypto-Beschleunigung ---------------------------------
-## ARM Crypto Extensions des BCM2710A1 nutzen
+## ----- Hardware Crypto Acceleration --------------------------
+## Leverage ARM Crypto Extensions on the BCM2710A1
 HardwareAccel 1
 
-## ----- Circuit-Timeouts --------------------------------------
-## Etwas großzügiger für den langsameren Pi Zero 2
+## ----- Circuit Timeouts --------------------------------------
+## Allow more time for the slower Pi Zero 2
 CircuitBuildTimeout 90
 LearnCircuitBuildTimeout 1
-## Streams 60 s auf ein Circuit warten lassen
+## Let streams wait up to 60 s for a suitable circuit
 CircuitStreamTimeout 60
-## Circuits 10 Min. wiederverwenden (Standard)
+## Reuse circuits for up to 10 min (default)
 MaxCircuitDirtiness 600
 
-## ----- Dormant Mode (Stromsparen) ----------------------------
-## Bei Inaktivität in den Schlafmodus wechseln
+## ----- Dormant Mode (Power Saving) ---------------------------
+## Enter sleep mode after 30 min of inactivity
 DormantClientTimeout 1800
-## Beim Neustart nicht automatisch aufwachen
+## Do not wake up automatically on restart
 DormantCanceledByStartup 0
 
-## ----- Verbindungslimits -------------------------------------
-## Offene Dateideskriptoren begrenzen (Pi-freundlich)
+## ----- Connection Limits -------------------------------------
+## Keep file descriptor usage low (Pi-friendly)
 ConnLimit 500
-## Maximal 24 gleichzeitige Circuits im Aufbau
+## Cap concurrent circuit builds
 MaxClientCircuitsPending 24
 
 ## ----- Keepalive ---------------------------------------------
-## Verbindungen alle 2 Min. am Leben halten
+## Send keepalive every 2 min to keep connections alive
 KeepalivePeriod 120
 
-## ----- Bandbreite (optional, auskommentiert) -----------------
-## Bei Bedarf aktivieren, um den Pi nicht zu überlasten
+## ----- Bandwidth (optional, uncomment if needed) -------------
+## Uncomment to throttle throughput and reduce CPU load
 # BandwidthRate 1 MBytes
 # BandwidthBurst 2 MBytes
 
-## ----- Vanguards (Guard-Schutz) ------------------------------
-## Schützt vor Guard-Discovery-Angriffen
+## ----- Guard Protection --------------------------------------
+## Protect against guard discovery attacks
 VanguardsLiteEnabled 1
 
 ## ----- Logging -----------------------------------------------
-## Nur Warnungen und Fehler loggen – spart I/O auf der SD-Karte
+## Log warnings and above only – reduces SD card I/O
 Log notice stderr
 
-## ----- Sicherheit --------------------------------------------
-## Keine Relay-Funktionalität – reiner Client-Modus
+## ----- Security ----------------------------------------------
+## Pure client mode – never act as a relay
 ClientOnly 1
