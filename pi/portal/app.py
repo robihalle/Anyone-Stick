@@ -1,8 +1,50 @@
 from flask import Flask, request, jsonify, render_template_string, redirect
-import subprocess, time
+import subprocess, time, os, signal, re
 
 app = Flask(__name__)
 stats = {"rx": 0, "tx": 0, "time": 0, "speed_rx": 0, "speed_tx": 0}
+ANONRC_PATH = "/etc/anonrc"
+
+# Verfügbare Exit-Länder (ISO 3166-1 alpha-2)
+EXIT_COUNTRIES = [
+    ("auto", "🌍 Automatic (Best Available)"),
+    ("at", "🇦🇹 Austria"),
+    ("be", "🇧🇪 Belgium"),
+    ("bg", "🇧🇬 Bulgaria"),
+    ("br", "🇧🇷 Brazil"),
+    ("ca", "🇨🇦 Canada"),
+    ("ch", "🇨🇭 Switzerland"),
+    ("cz", "🇨🇿 Czech Republic"),
+    ("de", "🇩🇪 Germany"),
+    ("dk", "🇩🇰 Denmark"),
+    ("es", "🇪🇸 Spain"),
+    ("fi", "🇫🇮 Finland"),
+    ("fr", "🇫🇷 France"),
+    ("gb", "🇬🇧 United Kingdom"),
+    ("hr", "🇭🇷 Croatia"),
+    ("hu", "🇭🇺 Hungary"),
+    ("ie", "🇮🇪 Ireland"),
+    ("in", "🇮🇳 India"),
+    ("is", "🇮🇸 Iceland"),
+    ("it", "🇮🇹 Italy"),
+    ("jp", "🇯🇵 Japan"),
+    ("kr", "🇰🇷 South Korea"),
+    ("lu", "🇱🇺 Luxembourg"),
+    ("md", "🇲🇩 Moldova"),
+    ("nl", "🇳🇱 Netherlands"),
+    ("no", "🇳🇴 Norway"),
+    ("nz", "🇳🇿 New Zealand"),
+    ("pl", "🇵🇱 Poland"),
+    ("pt", "🇵🇹 Portugal"),
+    ("ro", "🇷🇴 Romania"),
+    ("rs", "🇷🇸 Serbia"),
+    ("se", "🇸🇪 Sweden"),
+    ("sg", "🇸🇬 Singapore"),
+    ("sk", "🇸🇰 Slovakia"),
+    ("ua", "🇺🇦 Ukraine"),
+    ("us", "🇺🇸 United States"),
+]
+
 
 def update_stats():
     global stats
@@ -17,8 +59,67 @@ def update_stats():
                         stats["speed_rx"] = (curr_rx - stats["rx"]) / dt
                         stats["speed_tx"] = (curr_tx - stats["tx"]) / dt
                     stats.update({"rx": curr_rx, "tx": curr_tx, "time": curr_t})
-    except: pass
+    except:
+        pass
     return stats
+
+
+def get_current_exit_country():
+    """Liest den aktuell konfigurierten ExitNodes-Ländercode aus der anonrc."""
+    try:
+        with open(ANONRC_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("ExitNodes"):
+                    # Format: ExitNodes {de}
+                    m = re.search(r'\{(\w+)\}', line)
+                    if m:
+                        return m.group(1).lower()
+    except FileNotFoundError:
+        pass
+    return "auto"
+
+
+def set_exit_country(country_code):
+    """
+    Schreibt ExitNodes + StrictNodes in die anonrc und sendet SIGHUP an anon.
+    country_code: ISO 3166 2-letter code oder 'auto' für keine Einschränkung.
+    """
+    try:
+        with open(ANONRC_PATH, "r") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    # Bestehende ExitNodes / StrictNodes Zeilen entfernen
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("ExitNodes") or stripped.startswith("StrictNodes"):
+            continue
+        new_lines.append(line)
+
+    # Trailing newline sicherstellen
+    if new_lines and not new_lines[-1].endswith("\n"):
+        new_lines[-1] += "\n"
+
+    # Neue Zeilen anfügen (nur wenn nicht "auto")
+    if country_code != "auto":
+        new_lines.append(f"ExitNodes {{{country_code}}}\n")
+        new_lines.append("StrictNodes 1\n")
+
+    with open(ANONRC_PATH, "w") as f:
+        f.writelines(new_lines)
+
+    # SIGHUP an anon-Prozess senden → Config wird live nachgeladen
+    try:
+        pid = subprocess.check_output("pgrep -f '/usr/local/bin/anon'", shell=True).decode().strip().split("\n")[0]
+        os.kill(int(pid), signal.SIGHUP)
+    except Exception:
+        pass
+
+    return True
+
 
 HTML = """
 <!DOCTYPE html>
@@ -46,17 +147,25 @@ HTML = """
     .btn-secondary { background: #21262d; color: #fff; border: 1px solid var(--border); }
     .wifi-item { padding: 12px; border-bottom: 1px solid var(--border); cursor: pointer; display: flex; justify-content: space-between; font-size: 14px; }
     .connected-label { color: var(--secondary); font-weight: 800; font-size: 10px; border: 1px solid var(--secondary); padding: 2px 6px; border-radius: 4px; }
-    input { width: 100%; padding: 14px; background: #0d1117; border: 1px solid var(--border); border-radius: 8px; color: #fff; margin: 10px 0; box-sizing: border-box; }
+    input, select { width: 100%; padding: 14px; background: #0d1117; border: 1px solid var(--border); border-radius: 8px; color: #fff; margin: 10px 0; box-sizing: border-box; font-family: inherit; font-size: 14px; }
+    select { appearance: none; -webkit-appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238b949e' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 14px center; cursor: pointer; }
+    select option { background: #0d1117; color: #fff; }
+    .helper-text { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+    .circuit-status { display: flex; align-items: center; gap: 8px; margin-bottom: 15px; padding: 10px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+    .circuit-status.active { background: rgba(3,189,197,0.08); color: var(--secondary); }
+    .circuit-status.inactive { background: rgba(255,255,255,0.03); color: var(--text-dim); }
 </style>
 </head>
 <body>
 <div class="container">
     <img src="/static/logo.jpg" onerror="this.src='/static/logo.png'" class="logo-img">
+
     <div class="card">
         <h3>System Status</h3>
         <div class="status-indicator {{ 'active' if privacy else '' }}"><div class="dot"></div>{{ 'PRIVACY ACTIVE' if privacy else 'NORMAL MODE' }}</div>
         <form action="/mode/{{ 'normal' if privacy else 'privacy' }}" method="post"><button class="{{ 'btn-secondary' if privacy else 'btn-primary' }}">{{ 'Switch to Normal' if privacy else 'Enable Privacy' }}</button></form>
     </div>
+
     <div class="card">
         <h3>Live Traffic</h3>
         <div class="traffic-grid">
@@ -64,6 +173,23 @@ HTML = """
             <div><div style="font-size:10px;color:var(--text-dim)">UPLOAD</div><div class="traffic-val" id="tx">0 MB</div><div class="traffic-speed" id="s_tx">0 KB/s</div></div>
         </div>
     </div>
+
+    <div class="card">
+        <h3>Anyone Circuit</h3>
+        <div class="circuit-status {{ 'active' if privacy and exit_country != 'auto' else 'inactive' }}" id="circuit-status">
+            {{ '🔒 Exit: ' + exit_country.upper() if exit_country != 'auto' else '🌍 Automatic exit selection' }}
+        </div>
+        <label style="font-size:12px; color:var(--text-dim);">Exit Node Country</label>
+        <select id="exit-country">
+            {% for code, name in countries %}
+            <option value="{{ code }}" {{ 'selected' if code == exit_country else '' }}>{{ name }}</option>
+            {% endfor %}
+        </select>
+        <p class="helper-text" id="circuit-helper">
+            {{ 'Select a country to route your traffic through.' if privacy else 'Enable Privacy Mode first to apply circuit changes.' }}
+        </p>
+    </div>
+
     <div class="card">
         <h3>Wi-Fi</h3>
         <button id="scan-btn" class="btn-secondary" onclick="scan()">Scan Networks</button>
@@ -77,6 +203,36 @@ HTML = """
 </div>
 <script>
 let targetSSID = "";
+const privacyActive = {{ 'true' if privacy else 'false' }};
+
+// Exit-Country: automatisch speichern bei Änderung
+document.getElementById('exit-country').addEventListener('change', async function() {
+    if (!privacyActive) {
+        alert("Enable Privacy Mode first to apply circuit changes.");
+        this.value = "{{ exit_country }}";
+        return;
+    }
+    const cc = this.value;
+    const status = document.getElementById('circuit-status');
+    status.innerText = "⏳ Applying...";
+    try {
+        const res = await fetch('/api/circuit', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({exit_country: cc})
+        });
+        const data = await res.json();
+        if (res.ok) {
+            status.className = cc !== 'auto' ? 'circuit-status active' : 'circuit-status inactive';
+            status.innerText = cc !== 'auto' ? '🔒 Exit: ' + cc.toUpperCase() : '🌍 Automatic exit selection';
+        } else {
+            alert(data.status || "Error applying circuit settings");
+        }
+    } catch(e) {
+        alert("Error connecting to server");
+    }
+});
+
 async function updateTraffic(){
     try {
         const res = await fetch('/api/traffic'); const d = await res.json();
@@ -123,18 +279,53 @@ async function connect(){
 }
 </script></body></html>
 """
+
+
 @app.route('/')
 def index():
-    p = subprocess.run("sudo iptables -t nat -L PREROUTING -n | grep 9040", shell=True, capture_output=True).returncode == 0
-    return render_template_string(HTML, privacy=p)
+    p = subprocess.run("sudo iptables -t nat -L PREROUTING -n | grep 9040",
+                       shell=True, capture_output=True).returncode == 0
+    ec = get_current_exit_country()
+    return render_template_string(HTML, privacy=p, exit_country=ec, countries=EXIT_COUNTRIES)
+
 
 @app.route('/api/traffic')
-def traffic(): return jsonify(update_stats())
+def traffic():
+    return jsonify(update_stats())
+
+
+@app.route('/api/circuit', methods=['GET'])
+def get_circuit():
+    return jsonify({"exit_country": get_current_exit_country()})
+
+
+@app.route('/api/circuit', methods=['POST'])
+def post_circuit():
+    data = request.get_json()
+    if not data or "exit_country" not in data:
+        return jsonify({"status": "Missing exit_country"}), 400
+
+    cc = data["exit_country"].lower().strip()
+
+    # Validierung: nur bekannte Codes oder "auto"
+    valid_codes = [c[0] for c in EXIT_COUNTRIES]
+    if cc not in valid_codes:
+        return jsonify({"status": f"Invalid country code: {cc}"}), 400
+
+    # Privacy-Mode prüfen
+    p = subprocess.run("sudo iptables -t nat -L PREROUTING -n | grep 9040",
+                       shell=True, capture_output=True).returncode == 0
+    if not p:
+        return jsonify({"status": "Privacy Mode must be active"}), 400
+
+    set_exit_country(cc)
+    return jsonify({"status": "ok", "exit_country": cc})
+
 
 @app.route('/wifi/scan')
 def w_scan():
-    # Liste der SSIDs und deren Status holen
-    raw = subprocess.check_output("nmcli -t -f SSID,ACTIVE dev wifi list", shell=True).decode('utf-8')
+    raw = subprocess.check_output("nmcli -t -f SSID,ACTIVE dev wifi list",
+                                  shell=True).decode('utf-8')
     networks = []
     seen = set()
     for line in raw.split('\n'):
@@ -146,24 +337,33 @@ def w_scan():
                 seen.add(ssid)
     return jsonify({"networks": networks})
 
+
 @app.route('/wifi/connect', methods=['POST'])
 def w_conn():
-    d = request.json
-    ssid = d.get('ssid')
-    # Bestehendes Profil löschen, um Credentials-Fehler zu vermeiden
-    subprocess.run(["sudo", "nmcli", "con", "delete", ssid], capture_output=True)
-    res = subprocess.run(["sudo", "nmcli", "dev", "wifi", "connect", ssid, "password", d.get('password')], capture_output=True, text=True)
-    return jsonify({"status": "Connected!" if res.returncode==0 else res.stderr.strip()})
+    data = request.get_json()
+    ssid = data.get("ssid", "")
+    pw = data.get("password", "")
+    try:
+        subprocess.run(f'nmcli dev wifi connect "{ssid}" password "{pw}"',
+                       shell=True, check=True, capture_output=True, timeout=30)
+        return jsonify({"status": "Connected!"})
+    except subprocess.CalledProcessError:
+        return jsonify({"status": "Connection failed"})
+    except subprocess.TimeoutExpired:
+        return jsonify({"status": "Timeout"})
+
 
 @app.route('/mode/privacy', methods=['POST'])
-def mode_p():
+def mode_privacy():
     subprocess.run("sudo /usr/local/bin/mode_privacy.sh", shell=True)
     return redirect('/')
 
+
 @app.route('/mode/normal', methods=['POST'])
-def mode_n():
+def mode_normal():
     subprocess.run("sudo /usr/local/bin/mode_normal.sh", shell=True)
     return redirect('/')
 
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80, threaded=True)
+    app.run(host='0.0.0.0', port=80)
