@@ -1,0 +1,13 @@
+[Unit]
+Description=USB Gadget Setup
+DefaultDependencies=no
+After=sysinit.target
+Before=network.target anyone-stick.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/usb_gadget_setup.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
