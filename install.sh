@@ -268,43 +268,44 @@ log "mode_privacy.sh & mode_normal.sh installiert"
 # ── 12. Start-Script ────────────────────────────────────────────────────
 cat > ${SCRIPT_DIR}/start_anyone_stack.sh << 'SCRIPT'
 #!/bin/bash
-echo timer | sudo tee /sys/class/leds/default-on/trigger
+# Anyone Privacy Stick – Master Startup Script
+echo timer | sudo tee /sys/class/leds/default-on/trigger >/dev/null
 
-# State Directory sicherstellen
 mkdir -p /var/lib/anyone-stick
 
-# USB-Gadget ist bereits über usb-gadget.service aktiv.
-# Kurz warten bis usb0 wirklich da ist (max 5s).
+# 1. Warten auf usb0 (max 5s)
 for i in $(seq 1 10); do
     ip link show usb0 &>/dev/null && break
     sleep 0.5
 done
 
-# Statische IP für usb0 setzen (kein ifupdown nötig)
+if ! ip link show usb0 &>/dev/null; then
+    echo "FEHLER: usb0 nicht gefunden nach 5s"
+    exit 1
+fi
+
+# 2. Statische IP setzen (SOFORT – Windows wartet auf DHCP!)
 ip addr flush dev usb0 2>/dev/null
 ip addr add 192.168.7.1/24 dev usb0
 ip link set usb0 up
+sleep 0.5
 
-# Kurz warten bis IP wirklich gebunden ist
-sleep 1
-
-# DHCP starten – dnsmasq bindet sich dynamisch an usb0
+# 3. dnsmasq starten (DHCP für den Host-PC)
 systemctl restart dnsmasq
 
-# Warten bis dnsmasq läuft, dann WLAN im Hintergrund
-sleep 1
-nmcli con up "Stick-Gateway" &
-
-# Portal sofort starten
+# 4. Portal starten
 python3 /home/pi/portal/app.py &
 
-# Aktiv auf WLAN-Verbindung warten (max 30s)
+# 5. WLAN im Hintergrund
+nmcli con up "Stick-Gateway" 2>/dev/null &
+
+# 6. Auf WLAN warten (max 30s)
 for i in $(seq 1 30); do
     nmcli -t -f STATE general 2>/dev/null | grep -q "connected" && break
     sleep 1
 done
 
-# Anon-Stack starten
+# 7. Anon starten (blockiert – hält Service am Leben)
 /usr/local/bin/anon -f /etc/anonrc
 SCRIPT
 chmod +x ${SCRIPT_DIR}/start_anyone_stack.sh
@@ -313,19 +314,21 @@ log "start_anyone_stack.sh installiert"
 # ── 13. dnsmasq konfigurieren ───────────────────────────────────────────
 cat > /etc/dnsmasq.d/usb0.conf << 'EOF'
 interface=usb0
-bind-dynamic
+bind-interfaces
 dhcp-range=192.168.7.2,192.168.7.20,255.255.255.0,24h
 dhcp-option=3,192.168.7.1
 dhcp-option=6,192.168.7.1
-dhcp-authoritative
-leasefile-ro
 EOF
 log "dnsmasq konfiguriert für usb0 (192.168.7.0/24)"
 
 # ── 14. Statische IP für usb0 ──────────────────────────────────────────
-# Wird dynamisch in start_anyone_stack.sh per 'ip addr add' gesetzt.
-# Kein ifupdown nötig (Bookworm nutzt NetworkManager).
-log "Statische IP 192.168.7.1 wird beim Start per 'ip addr add' gesetzt"
+cat > /etc/network/interfaces.d/usb0 << 'EOF'
+auto usb0
+iface usb0 inet static
+    address 192.168.7.1
+    netmask 255.255.255.0
+EOF
+log "Statische IP 192.168.7.1 für usb0 konfiguriert"
 
 # ── 15. NetworkManager: usb0 ignorieren (wird manuell verwaltet) ───────
 mkdir -p /etc/NetworkManager/conf.d
@@ -681,7 +684,8 @@ Requires=usb-gadget.service
 
 [Service]
 ExecStart=/usr/local/bin/start_anyone_stack.sh
-Restart=always
+Restart=on-failure
+RestartSec=3
 User=root
 
 [Install]
@@ -691,7 +695,7 @@ EOF
 systemctl daemon-reload
 systemctl enable usb-gadget.service
 systemctl enable anyone-stick.service
-systemctl enable dnsmasq
+systemctl disable dnsmasq  # wird von start_anyone_stack.sh manuell gestartet
 log "Systemd Services aktiviert"
 
 # ── 18. Kernel-Module laden ─────────────────────────────────────────────

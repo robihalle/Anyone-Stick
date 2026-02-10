@@ -5,7 +5,8 @@ Requires=usb-gadget.service
 
 [Service]
 ExecStart=/usr/local/bin/start_anyone_stack.sh
-Restart=always
+Restart=on-failure
+RestartSec=3
 User=root
 
 [Install]
