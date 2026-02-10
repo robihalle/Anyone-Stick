@@ -4,9 +4,7 @@ import subprocess, time, os, signal, re, socket, threading, queue, json, logging
 app = Flask(__name__, static_folder="static")
 log = logging.getLogger("anyone-stick")
 
-# ════════════════════════════════════════════════════════════════════
 # Traffic stats
-# ════════════════════════════════════════════════════════════════════
 stats = {"rx": 0, "tx": 0, "time": 0, "speed_rx": 0, "speed_tx": 0}
 ANONRC_PATH = "/etc/anonrc"
 
@@ -33,20 +31,19 @@ EXIT_COUNTRIES = [
 ]
 
 
-# ════════════════════════════════════════════════════════════════════
-# AnonController v2 — Persistent connection + Event system
-# ════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# AnonController v2 – Persistent connection with event support
+# ═══════════════════════════════════════════════════════════════
 
 class AnonController:
-    """Persistent connection to the anon daemon via ControlPort 9051.
+    """Persistent connection to the anon daemon ControlPort with event support.
 
-    Key improvements over v1:
-      - Single persistent TCP connection (no connect/auth per command)
-      - Background reader thread splits replies (250) from async events (650)
-      - SETEVENTS CIRC STREAM STATUS_CLIENT for push-based monitoring
-      - Thread-safe command() with reply queue
-      - In-memory circuit & bootstrap state (no polling needed)
-      - SSE broadcast to all connected browser clients
+    Changes from v1:
+    - Single persistent TCP connection (re-established on failure)
+    - Background listener thread separates replies (250) from events (650)
+    - SETEVENTS CIRC STATUS_CLIENT for push-based monitoring
+    - Thread-safe reply queue for command/response correlation
+    - SSE broadcast to all connected frontend clients
     """
 
     COUNTRY_NAMES = {
@@ -75,101 +72,102 @@ class AnonController:
 
         # Connection state
         self._sock = None
-        self._lock = threading.Lock()          # serialize command()
-        self._reply_queue = queue.Queue()       # 250/5xx replies land here
-        self._reader_thread = None
+        self._lock = threading.Lock()          # protects _sock writes
+        self._reply_queue = queue.Queue()       # 250/251/... replies
         self._connected = False
-        self._shutting_down = False
+        self._authenticated = False
 
-        # ── Cached state (updated by events) ─────────────────────
-        self._bootstrap = {"progress": 0, "summary": "Starting…", "state": "stopped"}
-        self._circuits = {}                    # circuit_id → {status, path_raw, hops:[...]}
-        self._bootstrap_lock = threading.Lock()
-        self._circuit_lock = threading.Lock()
-
-        # ── SSE subscribers ───────────────────────────────────────
-        self._sse_queues = []                  # list of queue.Queue per browser tab
+        # Event state (pushed by anon daemon)
+        self._sse_clients = []                  # list of queue.Queue per SSE client
         self._sse_lock = threading.Lock()
 
-        # Auto-connect in background
-        self._connect_thread = threading.Thread(target=self._connect_loop, daemon=True)
-        self._connect_thread.start()
+        # Cached state from events (always up-to-date)
+        self._bootstrap = {"progress": 0, "summary": "", "tag": ""}
+        self._circuit_hops = []                 # latest BUILT circuit hops
+        self._last_circ_id = None
+        self._state_lock = threading.RLock()    # protects cached state
 
-    # ──────────────────────────────────────────────────────────────
-    # SSE subscriber management
-    # ──────────────────────────────────────────────────────────────
-    def sse_subscribe(self):
-        """Register a new SSE client, returns its queue."""
-        q = queue.Queue(maxsize=50)
-        with self._sse_lock:
-            self._sse_queues.append(q)
-        return q
+        # Background threads
+        self._reader_thread = None
+        self._reconnect_thread = None
+        self._stop_event = threading.Event()
 
-    def sse_unsubscribe(self, q):
-        """Remove an SSE client."""
-        with self._sse_lock:
-            try:
-                self._sse_queues.remove(q)
-            except ValueError:
-                pass
+    # ── Lifecycle ────────────────────────────────────────────
 
-    def _sse_broadcast(self, event_type, data):
-        """Push an event to all connected browser tabs."""
-        msg = json.dumps({"type": event_type, **data})
-        with self._sse_lock:
-            dead = []
-            for q in self._sse_queues:
-                try:
-                    q.put_nowait(msg)
-                except queue.Full:
-                    dead.append(q)
-            for q in dead:
-                self._sse_queues.remove(q)
+    def start(self):
+        """Start the persistent connection (call once at app startup)."""
+        self._stop_event.clear()
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_loop, daemon=True, name="anon-reconnect"
+        )
+        self._reconnect_thread.start()
 
-    # ──────────────────────────────────────────────────────────────
-    # Connection lifecycle
-    # ──────────────────────────────────────────────────────────────
-    def _connect_loop(self):
-        """Keep trying to connect (handles anon restarts)."""
-        while not self._shutting_down:
+    def stop(self):
+        """Shut down the persistent connection."""
+        self._stop_event.set()
+        self._disconnect()
+
+    # ── Connection management ────────────────────────────────
+
+    def _reconnect_loop(self):
+        """Keep trying to (re)connect to the ControlPort."""
+        while not self._stop_event.is_set():
             if not self._connected:
                 try:
                     self._connect()
                 except Exception as e:
-                    log.debug("Control connect failed: %s", e)
-                    time.sleep(3)
-                    continue
-            time.sleep(1)
+                    log.debug("ControlPort connect failed: %s", e)
+            self._stop_event.wait(timeout=3)
 
     def _connect(self):
-        """Open TCP, authenticate, subscribe to events."""
+        """Open TCP connection, authenticate, subscribe to events."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
         sock.connect((self.host, self.port))
-        sock.settimeout(None)   # blocking reads in reader thread
+        sock.settimeout(None)  # blocking mode for reader thread
+
         self._sock = sock
+        self._connected = True
+        self._authenticated = False
+
+        # Drain any stale replies
+        while not self._reply_queue.empty():
+            try:
+                self._reply_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Start reader thread BEFORE authenticating
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="anon-reader"
+        )
+        self._reader_thread.start()
 
         # Authenticate
         if not self._authenticate():
-            sock.close()
-            raise ConnectionError("Authentication failed")
+            self._disconnect()
+            return
 
-        self._connected = True
-        log.info("Control port connected & authenticated")
+        self._authenticated = True
 
         # Subscribe to events
-        self._send("SETEVENTS CIRC STATUS_CLIENT")
-        self._read_reply()  # consume 250 OK
+        self._subscribe_events()
 
-        # Start reader thread
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
+        log.info("ControlPort connected and subscribed to events")
 
-        # Seed initial state
-        self._seed_state()
+    def _disconnect(self):
+        """Close the connection."""
+        self._connected = False
+        self._authenticated = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
 
     def _authenticate(self):
-        """Cookie auth → empty password → bare auth."""
+        """Try cookie auth, then empty password, then bare AUTHENTICATE."""
         methods = []
         try:
             with open(self.cookie_path, "rb") as f:
@@ -180,304 +178,174 @@ class AnonController:
         methods += ['AUTHENTICATE ""', "AUTHENTICATE"]
 
         for m in methods:
-            self._send(m)
-            resp = self._read_reply_raw()
+            resp = self._command_raw(m)
             if resp and resp.startswith("250"):
                 return True
         return False
 
-    def _seed_state(self):
-        """Pull current bootstrap + circuits right after connect."""
-        # Bootstrap
-        try:
-            resp = self.command("GETINFO status/bootstrap-phase")
-            if resp:
-                self._parse_bootstrap_event(resp)
-        except Exception:
-            pass
+    def _subscribe_events(self):
+        """Tell anon to push CIRC and STATUS_CLIENT events."""
+        resp = self._command_raw("SETEVENTS CIRC STATUS_CLIENT")
+        if resp and "250" in resp:
+            log.info("Subscribed to CIRC + STATUS_CLIENT events")
+        else:
+            log.warning("Failed to subscribe to events: %s", resp)
 
-        # Existing circuits
-        try:
-            resp = self.command("GETINFO circuit-status")
-            if resp:
-                self._parse_circuit_status_bulk(resp)
-        except Exception:
-            pass
+    # ── Reader thread (core of Phase 1) ──────────────────────
 
-    def _close(self):
-        """Close the connection (will auto-reconnect)."""
-        self._connected = False
-        try:
-            self._sock.close()
-        except Exception:
-            pass
-        self._sock = None
-
-    # ──────────────────────────────────────────────────────────────
-    # Low-level I/O
-    # ──────────────────────────────────────────────────────────────
-    def _send(self, line):
-        """Send a single command line."""
-        self._sock.sendall(f"{line}\r\n".encode())
-
-    def _read_reply_raw(self):
-        """Read until we see a final status line (NNN SP ...).
-        Used only during auth before the reader thread runs."""
-        buf = b""
-        while True:
-            try:
-                chunk = self._sock.recv(4096)
-                if not chunk:
-                    return None
-                buf += chunk
-                text = buf.decode("utf-8", errors="replace")
-                for line in text.rstrip("\r\n").split("\r\n"):
-                    if len(line) >= 4 and line[3] == " " and line[:3].isdigit():
-                        return text
-            except socket.timeout:
-                break
-        return buf.decode("utf-8", errors="replace")
-
-    def _read_reply(self):
-        """Read a reply from the reply queue (used after reader thread is live)."""
-        try:
-            return self._reply_queue.get(timeout=10)
-        except queue.Empty:
-            return None
-
-    # ──────────────────────────────────────────────────────────────
-    # Reader thread: routes replies vs. async events
-    # ──────────────────────────────────────────────────────────────
     def _reader_loop(self):
-        """Continuously reads from socket, splits 250/650 lines."""
-        buf = ""
-        while self._connected and not self._shutting_down:
+        """Runs in background thread: reads lines from ControlPort,
+        routes replies to _reply_queue, routes events to _handle_event."""
+        buf = b""
+        sock = self._sock
+
+        while self._connected and not self._stop_event.is_set():
             try:
-                chunk = self._sock.recv(8192)
+                chunk = sock.recv(4096)
                 if not chunk:
-                    log.warning("Control port connection closed")
-                    self._close()
-                    return
-                buf += chunk.decode("utf-8", errors="replace")
+                    break
+                buf += chunk
 
                 # Process complete lines
-                while "\r\n" in buf:
-                    line, buf = buf.split("\r\n", 1)
-                    self._route_line(line)
+                while b"\r\n" in buf:
+                    line_bytes, buf = buf.split(b"\r\n", 1)
+                    line = line_bytes.decode("utf-8", errors="replace")
 
-            except OSError:
-                if not self._shutting_down:
-                    log.warning("Control port read error, reconnecting")
-                    self._close()
-                return
+                    if not line:
+                        continue
 
-    def _route_line(self, line):
-        """Route a single line to event handler or reply queue."""
-        if not line:
-            return
+                    # 650 = async event from anon
+                    if line.startswith("650"):
+                        self._handle_event(line)
+                    # Multi-line reply continuation (e.g., 250+, 250-)
+                    elif len(line) >= 4 and line[3] == "-":
+                        # accumulate multi-line replies
+                        self._multi_line_buf = getattr(self, "_multi_line_buf", "") + line + "\r\n"
+                    elif len(line) >= 4 and line[3] == " " and line[:3].isdigit():
+                        # Final line of a reply
+                        full = getattr(self, "_multi_line_buf", "") + line
+                        self._multi_line_buf = ""
+                        self._reply_queue.put(full)
+                    else:
+                        # Data line within multi-line (e.g., circuit-status output)
+                        self._multi_line_buf = getattr(self, "_multi_line_buf", "") + line + "\r\n"
 
-        # Async event (650 = async notification)
-        if line.startswith("650"):
-            self._handle_event(line)
-            return
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                break
+            except Exception as e:
+                log.debug("Reader error: %s", e)
+                break
 
-        # Mid-reply line (NNN-...) or final line (NNN ...) → reply queue
-        if len(line) >= 3 and line[:3].isdigit():
-            self._reply_queue.put(line)
-            return
+        self._connected = False
+        log.info("Reader thread exited – will reconnect")
 
-        # Data continuation line (e.g. circuit-status bulk)
-        # Append to last reply
-        self._reply_queue.put(line)
+    # ── Event handling ───────────────────────────────────────
 
-    # ──────────────────────────────────────────────────────────────
-    # Event handling (CIRC, STATUS_CLIENT)
-    # ──────────────────────────────────────────────────────────────
     def _handle_event(self, line):
-        """Dispatch a 650 event line."""
+        """Parse a 650 event line and update cached state + notify SSE clients."""
         # 650 CIRC <id> <status> [path] [flags...]
-        if " CIRC " in line:
-            self._handle_circ_event(line)
-        # 650 STATUS_CLIENT NOTICE BOOTSTRAP ...
-        elif "STATUS_CLIENT" in line and "BOOTSTRAP" in line:
-            self._parse_bootstrap_event(line)
+        # 650 STATUS_CLIENT NOTICE BOOTSTRAP PROGRESS=<n> ...
+        event = None
 
-    def _handle_circ_event(self, line):
-        """Parse: 650 CIRC <id> <status> [$fp~name,...] [BUILD_FLAGS=...] [PURPOSE=...]"""
-        parts = line.split()
-        # find CIRC keyword position
-        try:
-            idx = parts.index("CIRC")
-        except ValueError:
-            return
+        if "STATUS_CLIENT" in line and "BOOTSTRAP" in line:
+            event = self._parse_bootstrap_event(line)
 
-        if len(parts) < idx + 3:
-            return
+        elif " CIRC " in line:
+            event = self._parse_circ_event(line)
 
-        circ_id_str = parts[idx + 1]
-        status = parts[idx + 2]
+        if event:
+            self._broadcast_sse(event)
 
-        try:
-            circ_id = int(circ_id_str)
-        except ValueError:
-            return
-
-        # Path is the next part if it contains $ (fingerprints)
-        path_raw = ""
-        if len(parts) > idx + 3 and "$" in parts[idx + 3]:
-            path_raw = parts[idx + 3]
-
-        # Extract PURPOSE
-        purpose = ""
-        for p in parts:
-            if p.startswith("PURPOSE="):
-                purpose = p.split("=", 1)[1]
-
-        with self._circuit_lock:
-            if status in ("CLOSED", "FAILED"):
-                self._circuits.pop(circ_id, None)
-            else:
-                self._circuits[circ_id] = {
-                    "id": circ_id,
-                    "status": status,
-                    "path_raw": path_raw,
-                    "purpose": purpose,
-                    "updated": time.time(),
-                }
-
-        # Broadcast to SSE clients
-        self._sse_broadcast("circuit", {
-            "circuit_id": circ_id,
-            "status": status,
-            "purpose": purpose,
-        })
-
-    def _parse_bootstrap_event(self, text):
-        """Extract PROGRESS, SUMMARY, TAG from bootstrap status."""
+    def _parse_bootstrap_event(self, line):
+        """Parse: 650 STATUS_CLIENT NOTICE BOOTSTRAP PROGRESS=85 TAG=... SUMMARY=..."""
         progress = 0
         summary = ""
-        m = re.search(r"PROGRESS=(\d+)", text)
+        tag = ""
+
+        m = re.search(r"PROGRESS=(\d+)", line)
         if m:
             progress = int(m.group(1))
-        m = re.search(r'SUMMARY="([^"]*)"', text)
+        m = re.search(r'SUMMARY="([^"]*)"', line)
         if m:
             summary = m.group(1)
+        m = re.search(r"TAG=(\S+)", line)
+        if m:
+            tag = m.group(1)
+
+        with self._state_lock:
+            self._bootstrap = {"progress": progress, "summary": summary, "tag": tag}
 
         if progress >= 100:
             state = "connected"
-        elif progress > 0:
-            state = "bootstrapping"
         else:
-            state = "stopped"
+            state = "bootstrapping"
 
-        with self._bootstrap_lock:
-            old_progress = self._bootstrap.get("progress", 0)
-            self._bootstrap = {
-                "progress": progress,
-                "summary": summary or ("Connected" if progress >= 100 else f"Bootstrapping {progress}%"),
-                "state": state,
-            }
+        return {
+            "type": "status",
+            "state": state,
+            "progress": progress,
+            "summary": summary or f"Bootstrapping {progress}%",
+        }
 
-        # Only broadcast if progress actually changed
-        if progress != old_progress:
-            self._sse_broadcast("bootstrap", self._bootstrap)
+    def _parse_circ_event(self, line):
+        """Parse: 650 CIRC <id> <status> [$FP~Name,...] [BUILD_FLAGS=...] [PURPOSE=...]"""
+        parts = line.split()
+        if len(parts) < 4:
+            return None
 
-    def _parse_circuit_status_bulk(self, raw):
-        """Parse bulk GETINFO circuit-status response."""
-        with self._circuit_lock:
-            for line in raw.split("\r\n"):
-                line = line.strip()
-                if not line or line.startswith("250") or line == ".":
-                    continue
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                try:
-                    circ_id = int(parts[0])
-                except ValueError:
-                    continue
-                status = parts[1]
-                path_raw = parts[2] if len(parts) > 2 and "$" in parts[2] else ""
+        # parts: ['650', 'CIRC', '<id>', '<status>', ...]
+        circ_id = parts[2]
+        status = parts[3]
+
+        if status == "BUILT":
+            # Find the path (first token that contains $)
+            path_str = ""
+            for p in parts[4:]:
+                if "$" in p:
+                    path_str = p
+                    break
+
+            if path_str:
+                # Check PURPOSE – prefer GENERAL circuits
                 purpose = ""
-                for p in parts:
+                for p in parts[4:]:
                     if p.startswith("PURPOSE="):
                         purpose = p.split("=", 1)[1]
 
-                if status in ("CLOSED", "FAILED"):
-                    self._circuits.pop(circ_id, None)
-                else:
-                    self._circuits[circ_id] = {
-                        "id": circ_id,
-                        "status": status,
-                        "path_raw": path_raw,
-                        "purpose": purpose,
-                        "updated": time.time(),
-                    }
+                if purpose not in ("GENERAL", ""):
+                    return None  # skip HS_VANGUARDS etc.
 
-    # ──────────────────────────────────────────────────────────────
-    # Thread-safe command interface
-    # ──────────────────────────────────────────────────────────────
-    def command(self, cmd):
-        """Send a command and wait for the reply. Thread-safe."""
-        if not self._connected:
-            return None
-        with self._lock:
-            try:
-                # Drain stale replies
-                while not self._reply_queue.empty():
-                    try:
-                        self._reply_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                self._send(cmd)
-                return self._read_reply()
-            except Exception as e:
-                log.warning("command(%s) failed: %s", cmd, e)
-                self._close()
-                return None
+                with self._state_lock:
+                    self._last_circ_id = circ_id
+                    self._circuit_hops = self._parse_path(path_str)
 
-    # ──────────────────────────────────────────────────────────────
-    # High-level queries (used by Flask routes)
-    # ──────────────────────────────────────────────────────────────
-    def is_running(self):
-        try:
-            subprocess.check_output(["pgrep", "-x", "anon"])
-            return True
-        except Exception:
-            return False
+                return {
+                    "type": "circuit",
+                    "status": "BUILT",
+                    "circuit_id": circ_id,
+                    "hops": self._circuit_hops,
+                }
 
-    def get_status(self):
-        """Return bootstrap state (from cache — no control port call)."""
-        if not self.is_running():
-            return {"state": "stopped", "progress": 0, "summary": "Anon is not running"}
-        if not self._connected:
-            return {"state": "error", "progress": 0, "summary": "Cannot reach control port"}
-        with self._bootstrap_lock:
-            return dict(self._bootstrap)
+        elif status in ("CLOSED", "FAILED"):
+            with self._state_lock:
+                if circ_id == self._last_circ_id:
+                    self._circuit_hops = []
+                    self._last_circ_id = None
 
-    def get_circuit_detail(self):
-        """Return enriched hop list for the best BUILT circuit (from cache)."""
-        with self._circuit_lock:
-            # Pick best circuit: prefer BUILT + PURPOSE=GENERAL
-            best = None
-            for c in self._circuits.values():
-                if c["status"] != "BUILT":
-                    continue
-                if best is None or c.get("purpose") == "GENERAL":
-                    best = c
-                    if c.get("purpose") == "GENERAL":
-                        break
-            if not best:
-                return None
-            path_raw = best.get("path_raw", "")
+            return {
+                "type": "circuit",
+                "status": status,
+                "circuit_id": circ_id,
+                "hops": [],
+            }
 
-        if not path_raw:
-            return None
+        return None
 
-        # Parse hops: $FP~Name,$FP~Name,...
+    def _parse_path(self, path_str):
+        """Parse '$FP~Name,$FP~Name,...' into hop dicts."""
         hops = []
-        for relay in path_raw.split(","):
-            m = re.match(r"\$([0-9A-Fa-f]+)~(\S+)", relay)
+        for relay in path_str.split(","):
+            m = re.match(r"\$([0-9A-Fa-f]+)[~=](\S+)", relay)
             if m:
                 hops.append({
                     "fingerprint": m.group(1),
@@ -497,54 +365,234 @@ class AnonController:
         else:
             roles = []
 
-        # Enrich with IP + country (single persistent connection)
         for i, hop in enumerate(hops):
             hop["role"] = roles[i] if i < len(roles) else "relay"
 
-            # Get IP via ns/id/<fingerprint>
-            ns = self.command(f'GETINFO ns/id/{hop["fingerprint"]}')
-            if ns:
-                for nsline in ns.split("\r\n") if "\r\n" in ns else ns.split("\n"):
-                    if nsline.startswith("r "):
-                        fields = nsline.split()
-                        if len(fields) >= 7:
-                            hop["ip"] = fields[6]
-                        break
-
-            # Get country via ip-to-country/<ip>
-            if hop["ip"]:
-                cc_resp = self.command(f'GETINFO ip-to-country/{hop["ip"]}')
-                if cc_resp:
-                    cm = re.search(r"ip-to-country/\S+=(\S+)", cc_resp)
-                    if cm:
-                        cc = cm.group(1).upper()
-                        hop["country_code"] = cc
-                        hop["country_name"] = self.COUNTRY_NAMES.get(cc, cc)
+        # Enrich with IP + country (best-effort, non-blocking)
+        self._enrich_hops_async(hops)
 
         return hops
 
-    def new_circuit(self):
-        """Signal NEWNYM to build fresh circuits."""
-        return self.command("SIGNAL NEWNYM")
+    def _enrich_hops_async(self, hops):
+        """Resolve IP + country for each hop (runs in reader thread context)."""
+        for hop in hops:
+            try:
+                ns = self._command_raw(f'GETINFO ns/id/{hop["fingerprint"]}')
+                if ns:
+                    for nsline in ns.split("\r\n"):
+                        if nsline.startswith("r "):
+                            fields = nsline.split()
+                            if len(fields) >= 7:
+                                hop["ip"] = fields[6]
+                            break
+
+                if hop["ip"]:
+                    cc_resp = self._command_raw(f'GETINFO ip-to-country/{hop["ip"]}')
+                    if cc_resp:
+                        cm = re.search(r"ip-to-country/\S+=(\S+)", cc_resp)
+                        if cm:
+                            cc = cm.group(1).upper()
+                            hop["country_code"] = cc
+                            hop["country_name"] = self.COUNTRY_NAMES.get(cc, cc)
+            except Exception:
+                pass
+
+    # ── SSE (Server-Sent Events) broadcast ───────────────────
+
+    def add_sse_client(self):
+        """Register a new SSE client, return its queue."""
+        q = queue.Queue(maxsize=50)
+        with self._sse_lock:
+            self._sse_clients.append(q)
+
+        # Send current state immediately so client doesn't start blank
+        with self._state_lock:
+            status_event = self._build_status_dict()
+            circuit_event = {
+                "type": "circuit",
+                "status": "BUILT" if self._circuit_hops else "NONE",
+                "hops": self._circuit_hops,
+            }
+
+        try:
+            q.put_nowait(status_event)
+            q.put_nowait(circuit_event)
+        except queue.Full:
+            pass
+
+        return q
+
+    def remove_sse_client(self, q):
+        """Unregister an SSE client."""
+        with self._sse_lock:
+            try:
+                self._sse_clients.remove(q)
+            except ValueError:
+                pass
+
+    def _broadcast_sse(self, event):
+        """Push an event to all connected SSE clients."""
+        with self._sse_lock:
+            dead = []
+            for q in self._sse_clients:
+                try:
+                    q.put_nowait(event)
+                except queue.Full:
+                    dead.append(q)
+            for q in dead:
+                self._sse_clients.remove(q)
+
+    # ── Command interface (thread-safe) ──────────────────────
+
+    def _command_raw(self, cmd):
+        """Send a command and wait for the reply (250/5xx line)."""
+        with self._lock:
+            if not self._sock or not self._connected:
+                return None
+            try:
+                self._sock.sendall(f"{cmd}\r\n".encode())
+            except (BrokenPipeError, OSError):
+                self._connected = False
+                return None
+
+        # Wait for reply (routed by reader thread)
+        try:
+            return self._reply_queue.get(timeout=10)
+        except queue.Empty:
+            return None
+
+    def command(self, cmd):
+        """Public command interface – auto-reconnects if needed."""
+        if not self._connected or not self._authenticated:
+            return None
+        return self._command_raw(cmd)
+
+    # ── High-level queries (backward-compatible API) ─────────
+
+    def is_running(self):
+        try:
+            subprocess.check_output(["pgrep", "-x", "anon"])
+            return True
+        except Exception:
+            return False
+
+    def _build_status_dict(self):
+        """Build status dict from cached state (no ControlPort call needed)."""
+        if not self.is_running():
+            return {"type": "status", "state": "stopped", "progress": 0,
+                    "summary": "Anon is not running"}
+
+        if not self._connected:
+            return {"type": "status", "state": "error", "progress": 0,
+                    "summary": "Cannot reach control port"}
+
+        bs = self._bootstrap
+        if bs["progress"] >= 100:
+            return {"type": "status", "state": "connected", "progress": 100,
+                    "summary": bs["summary"] or "Connected"}
+        else:
+            return {"type": "status", "state": "bootstrapping",
+                    "progress": bs["progress"],
+                    "summary": bs["summary"] or f"Bootstrapping {bs['progress']}%"}
 
     def get_bootstrap(self):
-        """Return bootstrap dict (from cache)."""
-        with self._bootstrap_lock:
-            return dict(self._bootstrap)
+        """Return cached bootstrap state (no ControlPort call needed).
+        Falls back to active query if no events received yet."""
+        with self._state_lock:
+            if self._bootstrap["progress"] > 0:
+                return dict(self._bootstrap)
 
-    def shutdown(self):
-        """Clean shutdown."""
-        self._shutting_down = True
-        self._close()
+        # Fallback: direct query (first startup before events arrive)
+        resp = self.command("GETINFO status/bootstrap-phase")
+        if not resp:
+            return None
+        progress, summary, tag = 0, "", ""
+        m = re.search(r"PROGRESS=(\d+)", resp)
+        if m:
+            progress = int(m.group(1))
+        m = re.search(r'SUMMARY="([^"]*)"', resp)
+        if m:
+            summary = m.group(1)
+        m = re.search(r"TAG=(\S+)", resp)
+        if m:
+            tag = m.group(1)
+
+        with self._state_lock:
+            self._bootstrap = {"progress": progress, "summary": summary, "tag": tag}
+
+        return self._bootstrap
+
+    def get_status(self):
+        """Return overall connection state dict (backward-compatible)."""
+        with self._state_lock:
+            return self._build_status_dict()
+
+    def get_circuit_detail(self):
+        """Return the latest BUILT circuit hops (backward-compatible).
+        Uses cached hops from events, with fallback to active query."""
+        with self._state_lock:
+            if self._circuit_hops:
+                return list(self._circuit_hops)
+
+        # Fallback: active query (for first load before any CIRC event)
+        return self._query_circuit_detail()
+
+    def _query_circuit_detail(self):
+        """Active circuit query (fallback only, same logic as v1)."""
+        try:
+            raw = self.command("GETINFO circuit-status")
+            if not raw:
+                return None
+
+            built_path = None
+            for line in raw.split("\r\n"):
+                line = line.strip()
+                if not line or line.startswith("250") or line == ".":
+                    continue
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "BUILT":
+                    built_path = parts[2]
+                    if "PURPOSE=GENERAL" in line:
+                        break
+
+            if not built_path:
+                return None
+
+            hops = self._parse_path(built_path)
+
+            with self._state_lock:
+                self._circuit_hops = hops
+
+            return hops
+
+        except Exception:
+            return None
+
+    def new_circuit(self):
+        """Signal NEWNYM to build fresh circuits."""
+        resp = self.command("SIGNAL NEWNYM")
+
+        # Clear cached circuit so UI shows "building..."
+        with self._state_lock:
+            self._circuit_hops = []
+            self._last_circ_id = None
+
+        # Notify SSE clients immediately
+        self._broadcast_sse({
+            "type": "circuit",
+            "status": "NEWNYM",
+            "hops": [],
+        })
+
+        return resp
 
 
-# Instantiate global controller
 anon_ctrl = AnonController()
 
 
-# ════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 # Helper functions
-# ════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 def update_stats():
     global stats
@@ -603,9 +651,9 @@ def set_exit_country(country_code):
     return True
 
 
-# ════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 # HTML Template
-# ════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 HTML = """
 <!DOCTYPE html>
@@ -662,288 +710,266 @@ HTML = """
  .traffic-val { font-size:18px; font-weight:700; }
  .traffic-speed { font-size:11px; color:var(--secondary); font-weight:600; }
 
- /* Exit country */
- .circuit-status { padding:10px; border-radius:8px; font-size:12px; font-weight:600; text-align:center; margin-bottom:15px; }
- .circuit-status.active { background:rgba(3,189,197,0.1); color:var(--secondary); }
+ /* Buttons */
+ button { width:100%; padding:16px; border:none; border-radius:8px; font-size:14px; font-weight:700; cursor:pointer; transition:.2s; font-family:inherit; }
+ button:disabled { opacity:.5; cursor:not-allowed; }
+ .btn-primary { background:var(--gradient); color:#fff; }
+ .btn-secondary { background:#21262d; color:#fff; border:1px solid var(--border); }
+
+ /* Wi-Fi / Forms */
+ .wifi-item { padding:12px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; justify-content:space-between; font-size:14px; }
+ .connected-label { color:var(--secondary); font-weight:800; font-size:10px; border:1px solid var(--secondary); padding:2px 6px; border-radius:4px; }
+ input,select { width:100%; padding:14px; background:#0d1117; border:1px solid var(--border); border-radius:8px; color:#fff; margin:10px 0; font-family:inherit; font-size:14px; }
+ select { appearance:none; -webkit-appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238b949e' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 14px center; cursor:pointer; }
+ select option { background:#0d1117; color:#fff; }
+ .helper-text { font-size:11px; color:var(--dim); margin-top:4px; }
+ .circuit-status { display:flex; align-items:center; gap:8px; margin-bottom:15px; padding:10px; border-radius:6px; font-size:12px; font-weight:600; }
+ .circuit-status.active { background:rgba(3,189,197,0.08); color:var(--secondary); }
  .circuit-status.inactive { background:rgba(255,255,255,0.03); color:var(--dim); }
 
- /* Buttons */
- .btn-primary { background:var(--gradient); color:#FFF; border:none; padding:14px; border-radius:8px; font-weight:700; cursor:pointer; width:100%; font-size:14px; font-family:inherit; }
- .btn-secondary { background:rgba(255,255,255,0.06); color:var(--text); border:1px solid var(--border); padding:14px; border-radius:8px; font-weight:700; cursor:pointer; width:100%; font-size:14px; font-family:inherit; }
- .helper-text { font-size:11px; color:var(--dim); margin-top:6px; }
- select { width:100%; padding:10px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; font-family:inherit; margin-top:6px; }
- input[type=password] { width:100%; padding:10px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; font-family:inherit; margin-bottom:8px; }
-
- /* Wi-Fi */
- .wifi-item { display:flex; justify-content:space-between; align-items:center; padding:10px; cursor:pointer; border-bottom:1px solid var(--border); font-size:13px; }
- .wifi-item:hover { background:rgba(255,255,255,0.03); }
- .connected-label { color:var(--secondary); font-size:11px; font-weight:700; }
-
- /* SSE indicator */
- .sse-dot { display:inline-block; height:6px; width:6px; border-radius:50%; margin-right:6px; background:#555; }
+ /* SSE connection indicator */
+ .sse-dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-left:8px; vertical-align:middle; }
  .sse-dot.live { background:#03BDC5; box-shadow:0 0 6px #03BDC5; }
+ .sse-dot.dead { background:#f85149; }
 </style>
 </head>
 <body>
 <div class="container">
- <img src="/static/logo.png" alt="Anyone" class="logo-img" onerror="this.style.display='none'">
+ <img src="/static/logo.jpg" onerror="this.src='/static/logo.png'" class="logo-img">
 
  <!-- Connection Status -->
  <div class="card">
-  <h3><span class="sse-dot" id="sse-dot"></span>Anyone Connection</h3>
-  <div id="conn-badge" class="conn-badge stopped">
-   <div class="conn-dot"></div>
-   <span id="conn-label">Checking…</span>
-  </div>
-  <div class="progress-bar-bg"><div class="progress-bar-fill" id="conn-progress" style="width:0%"></div></div>
-  <div class="conn-summary" id="conn-summary">Waiting for status…</div>
+   <h3>Anyone Connection <span class="sse-dot dead" id="sse-dot" title="Live Events"></span></h3>
+   <div id="conn-badge" class="conn-badge stopped">
+     <div class="conn-dot"></div>
+     <span id="conn-label">Checking…</span>
+   </div>
+   <div class="progress-bar-bg"><div class="progress-bar-fill" id="conn-progress" style="width:0%"></div></div>
+   <div class="conn-summary" id="conn-summary">Waiting for status…</div>
  </div>
 
  <!-- Circuit Chain -->
  <div class="card">
-  <h3>Circuit Chain</h3>
-  <div id="circuit-container">
-   <div class="circuit-empty">No circuit available</div>
-  </div>
-  <button class="btn-sm btn-secondary" style="width:auto" onclick="newCircuit()" id="newnym-btn">&#x1f504; New Circuit</button>
+   <h3>Circuit Chain</h3>
+   <div id="circuit-container">
+     <div class="circuit-empty">No circuit available</div>
+   </div>
+   <button class="btn-sm btn-secondary" style="width:auto" onclick="newCircuit()" id="newnym-btn">&#x1f504; New Circuit</button>
  </div>
 
  <!-- Mode Switch -->
  <div class="card">
-  <h3>Mode</h3>
-  <div class="status-indicator {{ 'active' if privacy else '' }}"><div class="dot"></div>{{ 'PRIVACY ACTIVE' if privacy else 'NORMAL MODE' }}</div>
-  <form action="/mode/{{ 'normal' if privacy else 'privacy' }}" method="post"><button class="{{ 'btn-secondary' if privacy else 'btn-primary' }}">{{ 'Switch to Normal' if privacy else 'Enable Privacy' }}</button></form>
+   <h3>Mode</h3>
+   <div class="status-indicator {{ 'active' if privacy else '' }}"><div class="dot"></div>{{ 'PRIVACY ACTIVE' if privacy else 'NORMAL MODE' }}</div>
+   <form action="/mode/{{ 'normal' if privacy else 'privacy' }}" method="post"><button class="{{ 'btn-secondary' if privacy else 'btn-primary' }}">{{ 'Switch to Normal' if privacy else 'Enable Privacy' }}</button></form>
  </div>
 
  <!-- Live Traffic -->
  <div class="card">
-  <h3>Live Traffic</h3>
-  <div class="traffic-grid">
-   <div><div style="font-size:10px;color:var(--dim)">DOWNLOAD</div><div class="traffic-val" id="rx">0 MB</div><div class="traffic-speed" id="s_rx">0 KB/s</div></div>
-   <div><div style="font-size:10px;color:var(--dim)">UPLOAD</div><div class="traffic-val" id="tx">0 MB</div><div class="traffic-speed" id="s_tx">0 KB/s</div></div>
-  </div>
+   <h3>Live Traffic</h3>
+   <div class="traffic-grid">
+     <div><div style="font-size:10px;color:var(--dim)">DOWNLOAD</div><div class="traffic-val" id="rx">0 MB</div><div class="traffic-speed" id="s_rx">0 KB/s</div></div>
+     <div><div style="font-size:10px;color:var(--dim)">UPLOAD</div><div class="traffic-val" id="tx">0 MB</div><div class="traffic-speed" id="s_tx">0 KB/s</div></div>
+   </div>
  </div>
 
  <!-- Exit Country -->
  <div class="card">
-  <h3>Exit Country</h3>
-  <div class="circuit-status {{ 'active' if privacy and exit_country != 'auto' else 'inactive' }}" id="circuit-status">
-   {{ '\U0001f512 Exit: ' + exit_country.upper() if exit_country != 'auto' else '\U0001f30d Automatic exit selection' }}
-  </div>
-  <label style="font-size:12px;color:var(--dim)">Exit Node Country</label>
-  <select id="exit-country">
-   {% for code, name in countries %}
-   <option value="{{ code }}" {{ 'selected' if code == exit_country else '' }}>{{ name }}</option>
-   {% endfor %}
-  </select>
-  <p class="helper-text">{{ 'Select a country to route your traffic through.' if privacy else 'Enable Privacy Mode first.' }}</p>
+   <h3>Exit Country</h3>
+   <div class="circuit-status {{ 'active' if privacy and exit_country != 'auto' else 'inactive' }}" id="circuit-status">
+     {{ '\U0001f512 Exit: ' + exit_country.upper() if exit_country != 'auto' else '\U0001f30d Automatic exit selection' }}
+   </div>
+   <select id="exit-select" onchange="setExit(this.value)">
+     {% for code, name in countries %}
+     <option value="{{ code }}" {{ 'selected' if code == exit_country else '' }}>{{ name }}</option>
+     {% endfor %}
+   </select>
+   <div class="helper-text">Requires Privacy Mode. Changing country rebuilds circuits.</div>
  </div>
 
  <!-- Wi-Fi -->
  <div class="card">
-  <h3>Wi-Fi</h3>
-  <button id="scan-btn" class="btn-secondary" onclick="scan()">Scan Networks</button>
-  <div id="list" style="margin-top:10px"></div>
-  <div id="connect" style="display:none;margin-top:20px;border-top:1px solid var(--border);padding-top:10px;">
-   <p style="font-size:12px;color:var(--secondary)">Connecting to: <b id="ssid-name"></b></p>
-   <input type="password" id="pw" placeholder="Enter Password">
-   <button id="conn-btn" class="btn-primary" onclick="connectWifi()">Connect Now</button>
-  </div>
+   <h3>Wi-Fi</h3>
+   <button class="btn-secondary" id="scan-btn" onclick="scan()">Scan Networks</button>
+   <div id="list" style="margin-top:10px"></div>
+   <div id="connect" style="display:none;margin-top:15px">
+     <div style="font-weight:600" id="ssid-name"></div>
+     <input type="password" id="pw" placeholder="Password">
+     <button class="btn-primary" id="conn-btn" onclick="connectWifi()">Connect Now</button>
+   </div>
  </div>
 </div>
 
 <script>
-const privacyActive = {{ 'true' if privacy else 'false' }};
-let targetSSID = "";
+let targetSSID = '';
 
-/* Country flag emoji from 2-letter code */
 function flag(cc) {
- if (!cc || cc.length !== 2) return '\u{1F30D}';
+ if (!cc || cc.length !== 2) return '\u2014';
  return String.fromCodePoint(...[...cc.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
 }
 
-/* ══════════════════════════════════════════════════════════════════
-   SSE — Server-Sent Events (replaces polling for status & circuit)
-   ══════════════════════════════════════════════════════════════════ */
+// ═══════════════════════════════════════════════════════════
+// SSE – Server-Sent Events (replaces polling for status + circuit)
+// ═══════════════════════════════════════════════════════════
+
 let evtSource = null;
-let sseRetryTimer = null;
+let sseRetryTimeout = null;
 
 function connectSSE() {
- if (evtSource) { evtSource.close(); }
- evtSource = new EventSource('/api/events');
- const dot = document.getElementById('sse-dot');
+  if (evtSource) { evtSource.close(); }
 
- evtSource.onopen = () => {
-  dot.classList.add('live');
-  if (sseRetryTimer) { clearTimeout(sseRetryTimer); sseRetryTimer = null; }
- };
+  evtSource = new EventSource('/api/events');
+  const dot = document.getElementById('sse-dot');
 
- evtSource.onmessage = (e) => {
-  try {
-   const d = JSON.parse(e.data);
-   if (d.type === 'bootstrap') updateBootstrapUI(d);
-   else if (d.type === 'circuit') fetchCircuitDetail();
-  } catch(err) {}
- };
+  evtSource.onopen = () => {
+    dot.className = 'sse-dot live';
+    if (sseRetryTimeout) { clearTimeout(sseRetryTimeout); sseRetryTimeout = null; }
+  };
 
- evtSource.onerror = () => {
-  dot.classList.remove('live');
-  evtSource.close();
-  // Reconnect after 3s
-  sseRetryTimer = setTimeout(connectSSE, 3000);
- };
+  evtSource.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      if (d.type === 'status') updateStatus(d);
+      else if (d.type === 'circuit') updateCircuit(d);
+    } catch(err) {}
+  };
+
+  evtSource.onerror = () => {
+    dot.className = 'sse-dot dead';
+    evtSource.close();
+    // Reconnect after 3s
+    sseRetryTimeout = setTimeout(connectSSE, 3000);
+  };
 }
 
-function updateBootstrapUI(d) {
- const badge = document.getElementById('conn-badge');
- const label = document.getElementById('conn-label');
- const bar = document.getElementById('conn-progress');
- const summ = document.getElementById('conn-summary');
+// ── Status update (from SSE event) ──────────────────────
 
- badge.className = 'conn-badge ' + d.state;
- const labels = {stopped:'STOPPED', bootstrapping:'BOOTSTRAPPING', connected:'CONNECTED', error:'ERROR'};
- let lt = labels[d.state] || d.state.toUpperCase();
- if (d.state === 'bootstrapping') lt += ' ' + d.progress + '%';
- label.innerText = lt;
- bar.style.width = d.progress + '%';
- summ.innerText = d.summary || '';
+function updateStatus(d) {
+  const badge = document.getElementById('conn-badge');
+  const label = document.getElementById('conn-label');
+  const bar   = document.getElementById('conn-progress');
+  const summ  = document.getElementById('conn-summary');
+
+  badge.className = 'conn-badge ' + d.state;
+
+  const labels = {stopped:'STOPPED', bootstrapping:'BOOTSTRAPPING', connected:'CONNECTED', error:'ERROR'};
+  let lt = labels[d.state] || d.state.toUpperCase();
+  if (d.state === 'bootstrapping') lt += ' ' + d.progress + '%';
+  label.innerText = lt;
+  bar.style.width = d.progress + '%';
+  summ.innerText = d.summary || '';
 }
 
-/* ══════════════════════════════════════════════════════════════════
-   Circuit detail (fetched on-demand when SSE says circuit changed)
-   ══════════════════════════════════════════════════════════════════ */
-async function fetchCircuitDetail() {
- try {
-  const r = await fetch('/api/anon/circuit');
-  const d = await r.json();
+// ── Circuit update (from SSE event) ─────────────────────
+
+function updateCircuit(d) {
   const c = document.getElementById('circuit-container');
 
   if (!d.hops || d.hops.length === 0) {
-   c.innerHTML = '<div class="circuit-empty">No circuit established yet</div>';
-   return;
+    if (d.status === 'NEWNYM') {
+      c.innerHTML = '<div class="circuit-empty">\u23f3 Building new circuit\u2026</div>';
+    } else {
+      c.innerHTML = '<div class="circuit-empty">No circuit established yet</div>';
+    }
+    return;
   }
 
   let html = '<div class="circuit-chain">';
   d.hops.forEach((hop, i) => {
-   if (i > 0) html += '<div class="circuit-arrow">\u279C</div>';
-   const cc = hop.country_code || '';
-   html += '<div class="circuit-node' + (hop.role === 'exit' ? ' active-node' : '') + '">'
-    + '<div class="node-role">' + hop.role + '</div>'
-    + '<div class="node-flag">' + flag(cc) + '</div>'
-    + '<div class="node-name">' + (hop.nickname || '\u2014') + '</div>'
-    + '<div class="node-ip">' + (hop.ip || '\u2014') + '</div>'
-    + '<div class="node-country">' + (hop.country_name || cc || '\u2014') + '</div>'
-    + '</div>';
+    if (i > 0) html += '<div class="circuit-arrow">\u279C</div>';
+    const cc = hop.country_code || '';
+    html += '<div class="circuit-node' + (hop.role === 'exit' ? ' active-node' : '') + '">'
+      + '<div class="node-role">' + hop.role + '</div>'
+      + '<div class="node-flag">' + flag(cc) + '</div>'
+      + '<div class="node-name">' + (hop.nickname || '\u2014') + '</div>'
+      + '<div class="node-ip">' + (hop.ip || '\u2014') + '</div>'
+      + '<div class="node-country">' + (hop.country_name || cc || '\u2014') + '</div>'
+      + '</div>';
   });
   html += '</div>';
   c.innerHTML = html;
- } catch(e) {}
 }
 
-/* ══════════════════════════════════════════════════════════════════
-   Fallback polling (status + circuit) — only when SSE is down
-   ══════════════════════════════════════════════════════════════════ */
-async function pollStatus() {
- // Skip if SSE is connected
- if (evtSource && evtSource.readyState === EventSource.OPEN) return;
- try {
-  const r = await fetch('/api/anon/status');
-  const d = await r.json();
-  updateBootstrapUI(d);
- } catch(e) {}
-}
+// ── New circuit request ─────────────────────────────────
 
-async function pollCircuit() {
- if (evtSource && evtSource.readyState === EventSource.OPEN) return;
- fetchCircuitDetail();
-}
-
-/* ══════════════════════════════════════════════════════════════════
-   Actions
-   ══════════════════════════════════════════════════════════════════ */
 async function newCircuit() {
- const btn = document.getElementById('newnym-btn');
- btn.disabled = true; btn.innerText = '\u23F3 Requesting…';
- try {
-  await fetch('/api/anon/newcircuit', {method:'POST'});
-  // SSE will push the new circuit event — just wait a moment for it
-  await new Promise(r => setTimeout(r, 2000));
-  fetchCircuitDetail();
- } finally { btn.disabled = false; btn.innerHTML = '\u{1F504} New Circuit'; }
+  const btn = document.getElementById('newnym-btn');
+  btn.disabled = true; btn.innerText = '\u23F3 Requesting…';
+  try {
+    await fetch('/api/anon/newcircuit', {method:'POST'});
+    // No need to poll – SSE will push the new circuit
+  } finally {
+    setTimeout(() => { btn.disabled = false; btn.innerHTML = '\U0001f504 New Circuit'; }, 2000);
+  }
 }
 
-/* Traffic polling (stays at 1s — this is local /proc, not control port) */
+// ── Exit country ────────────────────────────────────────
+
+async function setExit(cc) {
+  try {
+    const r = await fetch('/api/circuit', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({exit_country: cc})
+    });
+    const d = await r.json();
+    if (d.status !== 'ok') alert(d.status);
+    else location.reload();
+  } catch(e) { alert('Error setting exit country'); }
+}
+
+// ── Traffic polling (still polled – 1s, too frequent for SSE) ──
+
 async function pollTraffic() {
- try {
-  const r = await fetch('/api/traffic'); const d = await r.json();
-  document.getElementById('rx').innerText = (d.rx/1048576).toFixed(1)+' MB';
-  document.getElementById('tx').innerText = (d.tx/1048576).toFixed(1)+' MB';
-  document.getElementById('s_rx').innerText = d.speed_rx>1048576?(d.speed_rx/1048576).toFixed(1)+' MB/s':(d.speed_rx/1024).toFixed(1)+' KB/s';
-  document.getElementById('s_tx').innerText = d.speed_tx>1048576?(d.speed_tx/1048576).toFixed(1)+' MB/s':(d.speed_tx/1024).toFixed(1)+' KB/s';
- } catch(e) {}
+  try {
+    const r = await fetch('/api/traffic'); const d = await r.json();
+    document.getElementById('rx').innerText = (d.rx/1048576).toFixed(1)+' MB';
+    document.getElementById('tx').innerText = (d.tx/1048576).toFixed(1)+' MB';
+    document.getElementById('s_rx').innerText = d.speed_rx>1048576?(d.speed_rx/1048576).toFixed(1)+' MB/s':(d.speed_rx/1024).toFixed(1)+' KB/s';
+    document.getElementById('s_tx').innerText = d.speed_tx>1048576?(d.speed_tx/1048576).toFixed(1)+' MB/s':(d.speed_tx/1024).toFixed(1)+' KB/s';
+  } catch(e) {}
 }
 
-/* Exit country selector */
-document.getElementById('exit-country').addEventListener('change', async function() {
- if (!privacyActive) { alert('Enable Privacy Mode first.'); this.value='{{ exit_country }}'; return; }
- const cc = this.value, st = document.getElementById('circuit-status');
- st.innerText = '\u23F3 Applying…';
- try {
-  const r = await fetch('/api/circuit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({exit_country:cc})});
-  const d = await r.json();
-  if (r.ok) { st.className = cc!=='auto'?'circuit-status active':'circuit-status inactive'; st.innerText = cc!=='auto'?'\u{1F512} Exit: '+cc.toUpperCase():'\u{1F30D} Automatic exit selection'; }
-  else alert(d.status||'Error');
- } catch(e) { alert('Connection error'); }
-});
+// ── Wi-Fi ───────────────────────────────────────────────
 
-/* Wi-Fi scan & connect */
 async function scan() {
- const btn=document.getElementById('scan-btn'); btn.disabled=true; btn.innerText='Scanning…';
- document.getElementById('list').innerHTML='';
- try {
-  const r=await fetch('/wifi/scan'); const d=await r.json();
-  let h='';
-  d.networks.forEach(n=>{
-   const tag=n.connected?'<span class="connected-label">CONNECTED</span>':'<span>\u203A</span>';
-   h+="<div class='wifi-item' onclick=\"sel('"+n.ssid.replace(/'/g,"\\'")+"')\"><span>"+n.ssid+"</span>"+tag+"</div>";
-  });
-  document.getElementById('list').innerHTML=h;
- } finally { btn.disabled=false; btn.innerText='Scan Networks'; }
+  const btn=document.getElementById('scan-btn'); btn.disabled=true; btn.innerText='Scanning…';
+  document.getElementById('list').innerHTML='';
+  try {
+    const r=await fetch('/wifi/scan'); const d=await r.json();
+    let h='';
+    d.networks.forEach(n=>{
+      const tag=n.connected?'<span class="connected-label">CONNECTED</span>':'<span>\u203A</span>';
+      h+="<div class='wifi-item' onclick=\"sel('"+n.ssid.replace(/'/g,"\\\\'")+"')\"><span>"+n.ssid+"</span>"+tag+"</div>";
+    });
+    document.getElementById('list').innerHTML=h;
+  } finally { btn.disabled=false; btn.innerText='Scan Networks'; }
 }
 function sel(s){ targetSSID=s; document.getElementById('ssid-name').innerText=s; document.getElementById('connect').style.display='block'; }
 async function connectWifi(){
- const btn=document.getElementById('conn-btn'), pw=document.getElementById('pw').value;
- btn.disabled=true; btn.innerText='Connecting…';
- try {
-  const r=await fetch('/wifi/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:targetSSID,password:pw})});
-  const d=await r.json(); alert(d.status);
-  if(d.status==='Connected!') location.reload();
- } catch(e){alert('Error');}
- finally { btn.disabled=false; btn.innerText='Connect Now'; }
+  const btn=document.getElementById('conn-btn'), pw=document.getElementById('pw').value;
+  btn.disabled=true; btn.innerText='Connecting…';
+  try {
+    const r=await fetch('/wifi/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:targetSSID,password:pw})});
+    const d=await r.json(); alert(d.status);
+    if(d.status==='Connected!') location.reload();
+  } catch(e){alert('Error');}
+  finally { btn.disabled=false; btn.innerText='Connect Now'; }
 }
 
-/* ══════════════════════════════════════════════════════════════════
-   Startup: SSE first, polling as fallback
-   ══════════════════════════════════════════════════════════════════ */
+// ═══════════════════════════════════════════════════════════
+// Start: SSE for status+circuit, polling only for traffic
+// ═══════════════════════════════════════════════════════════
 connectSSE();
-
-// Initial fetches
-pollStatus();
-fetchCircuitDetail();
 pollTraffic();
-
-// Fallback polling (only fires when SSE is disconnected)
-setInterval(pollStatus, 5000);
-setInterval(pollCircuit, 8000);
 setInterval(pollTraffic, 1000);
 </script>
 </body></html>
 """
 
 
-# ════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 # Routes
-# ════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 @app.route("/")
 def index():
@@ -952,6 +978,39 @@ def index():
     ec = get_current_exit_country()
     return render_template_string(HTML, privacy=p, exit_country=ec, countries=EXIT_COUNTRIES)
 
+
+# ── SSE endpoint (replaces status + circuit polling) ─────
+
+@app.route("/api/events")
+def sse_events():
+    """Server-Sent Events stream – pushes status + circuit updates in real-time."""
+    def generate():
+        q = anon_ctrl.add_sse_client()
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=30)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except queue.Empty:
+                    # Send keepalive comment to prevent proxy/browser timeout
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            anon_ctrl.remove_sse_client(q)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ── Backward-compatible REST endpoints (still work) ──────
 
 @app.route("/api/traffic")
 def traffic():
@@ -998,45 +1057,7 @@ def post_circuit():
     return jsonify({"status": "ok", "exit_country": cc})
 
 
-# ════════════════════════════════════════════════════════════════════
-# SSE endpoint — Server-Sent Events
-# ════════════════════════════════════════════════════════════════════
-
-@app.route("/api/events")
-def sse_stream():
-    """Server-Sent Events endpoint.
-    Pushes bootstrap & circuit events in real-time to the browser.
-    """
-    def generate():
-        q = anon_ctrl.sse_subscribe()
-        try:
-            # Send current state immediately on connect
-            status = anon_ctrl.get_status()
-            yield f"data: {json.dumps({'type': 'bootstrap', **status})}\n\n"
-
-            while True:
-                try:
-                    msg = q.get(timeout=30)
-                    yield f"data: {msg}\n\n"
-                except queue.Empty:
-                    # Keepalive comment (prevents proxy/browser timeout)
-                    yield ": keepalive\n\n"
-        except GeneratorExit:
-            pass
-        finally:
-            anon_ctrl.sse_unsubscribe(q)
-
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "X-Accel-Buffering": "no",   # nginx compatibility
-                        "Connection": "keep-alive",
-                    })
-
-
-# ════════════════════════════════════════════════════════════════════
-# Wi-Fi & Mode routes
-# ════════════════════════════════════════════════════════════════════
+# ── Wi-Fi ────────────────────────────────────────────────
 
 @app.route("/wifi/scan")
 def w_scan():
@@ -1078,6 +1099,13 @@ def mode_normal():
     subprocess.run("sudo /usr/local/bin/mode_normal.sh", shell=True)
     return redirect("/")
 
+
+# ═══════════════════════════════════════════════════════════════
+# Startup
+# ═══════════════════════════════════════════════════════════════
+
+# Start persistent ControlPort connection
+anon_ctrl.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=80, threaded=True)
