@@ -1569,80 +1569,72 @@ if (document.readyState === 'loading') {
 }
 </script>
 
+
 <script id="ks-js2-proof">
 (function(){
-  function run(){
-    const btn = document.getElementById('killswitch-btn');
+  // SUBTEXT PROOF: if this script runs at all, you MUST see this text change
+  const sub0 = document.getElementById('killswitch-sub');
+  if (sub0) sub0.textContent = 'JS2 loaded — searching for button…';
+
+  function abortableFetch(url, ms){
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), ms);
+    return fetch(url, { cache:'no-store', signal: ctl.signal })
+      .finally(() => clearTimeout(t));
+  }
+
+  async function refresh(btn, sub){
+    try{
+      const base = (location && location.origin) ? location.origin : '';
+      const r = await abortableFetch(base + '/api/killswitch/status', 2500);
+      const txt = await r.text();
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      const st = JSON.parse(txt);
+      const on = !!st.enabled;
+
+      btn.textContent = on ? 'Kill Switch: ON' : 'Kill Switch: OFF';
+      btn.style.background = on ? 'rgba(220, 38, 38, .95)' : 'rgba(34, 197, 94, .20)';
+      btn.style.borderColor = on ? 'rgba(220, 38, 38, .8)' : 'rgba(34, 197, 94, .35)';
+      btn.style.color = '#fff';
+
+      if(sub){
+        sub.textContent = on
+          ? 'JS2 running — egress is blocked. Only local management traffic is allowed.'
+          : 'JS2 running — blocks all non-local traffic from the Stick (Normal + Privacy mode).';
+      }
+    } catch(e){
+      btn.textContent = 'Kill Switch: error';
+      if(sub){
+        sub.textContent = 'JS2 error: ' + ((e && e.name === 'AbortError') ? 'timeout /api/killswitch/status' : (e && e.message ? e.message : String(e)));
+      }
+    }
+  }
+
+  function runOnce(){
+    const btn = document.getElementById('killswitch-btn') || document.querySelector('#killswitch-panel #killswitch-btn');
     const sub = document.getElementById('killswitch-sub');
     if(!btn) return false;
 
-    async function refresh(){
-      try{
-        const url = (location && location.origin ? location.origin : '') + '/api/killswitch/status';
-        const r = await fetch(url, { cache: 'no-store' });
-        const txt = await r.text();
-        if(!r.ok) throw new Error('HTTP ' + r.status);
-        const st = JSON.parse(txt);
-        const on = !!st.enabled;
+    // PROOF 2: as soon as button is found, you MUST see this
+    btn.textContent = 'Kill Switch: JS2…';
+    btn.style.color = '#fff';
+    btn.style.background = 'rgba(255,255,255,.08)';
+    btn.style.borderColor = 'rgba(255,255,255,.15)';
 
-        btn.textContent = on ? 'Kill Switch: ON' : 'Kill Switch: OFF';
-        btn.style.background = on ? 'rgba(220, 38, 38, .95)' : 'rgba(34, 197, 94, .20)';
-        btn.style.borderColor = on ? 'rgba(220, 38, 38, .8)' : 'rgba(34, 197, 94, .35)';
-        btn.style.color = '#fff';
-
-        if(sub){
-          sub.textContent = on
-            ? 'Egress is blocked. Only local management traffic is allowed.'
-            : 'Blocks all non-local traffic from the Stick (Normal + Privacy mode).';
-        }
-      } catch(e){
-        btn.textContent = 'Kill Switch: error';
-        if(sub) sub.textContent = 'JS error: ' + (e && e.message ? e.message : String(e));
-      }
-    }
-
-    // bind click once
-    if(btn.dataset.ksBound !== "1"){
-      btn.dataset.ksBound = "1";
-      btn.addEventListener('click', async () => {
-        // read current
-        let cur = false;
-        try{
-          const r = await fetch((location.origin || '') + '/api/killswitch/status', { cache:'no-store' });
-          const st = await r.json();
-          cur = !!st.enabled;
-        } catch(e){}
-
-        const target = !cur;
-        if(target){
-          const ok = confirm('Enable Kill Switch?
-
-This blocks all non-local traffic from the Stick (Normal + Privacy mode).');
-          if(!ok) return;
-        }
-
-        try{
-          await fetch((location.origin || '') + '/api/killswitch/set', {
-            method:'POST',
-            headers:{ 'Content-Type':'application/json' },
-            body: JSON.stringify({ enabled: target })
-          });
-        } catch(e){}
-
-        await refresh();
-      });
-    }
-
-    refresh();
-    setInterval(refresh, 2500);
+    refresh(btn, sub);
+    setInterval(() => refresh(btn, sub), 2500);
+    if (sub) sub.textContent = 'JS2 loaded — button found.';
     return true;
   }
 
-  // Wait until button exists (DOM timing safe)
   let tries = 0;
   const t = setInterval(() => {
     tries++;
-    if (run() || tries > 100) clearInterval(t); // ~10s max
+    if (runOnce() || tries > 600) {
+      clearInterval(t);
+      const sub = document.getElementById('killswitch-sub');
+      if (sub && tries > 600) sub.textContent = 'JS2 loaded — ERROR: button not found after 60s.';
+    }
   }, 100);
 })();
 </script>
