@@ -1,10 +1,20 @@
+#!/usr/bin/env python3
+# ============================================================================
+# Anyone Privacy Stick — Portal (app.py)
+# AnonController v2: persistent ControlPort + SSE push events
+# ============================================================================
+
 from flask import Flask, request, jsonify, render_template_string, redirect, Response
 import subprocess, time, os, signal, re, socket, threading, queue, json, logging
 
 app = Flask(__name__, static_folder="static")
 log = logging.getLogger("anyone-stick")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
-# Traffic stats
+# ──────────────────────────────────────────────
+# Global state
+# ──────────────────────────────────────────────
 stats = {"rx": 0, "tx": 0, "time": 0, "speed_rx": 0, "speed_tx": 0}
 ANONRC_PATH = "/etc/anonrc"
 
@@ -31,14 +41,14 @@ EXIT_COUNTRIES = [
 ]
 
 
-# ═══════════════════════════════════════════════════════════════
-# AnonController v2 – Persistent connection with event support
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
+# AnonController v2 — Persistent connection with event support
+# ============================================================================
 
 class AnonController:
     """Persistent connection to the anon daemon ControlPort with event support.
 
-    Changes from v1:
+    Architecture:
     - Single persistent TCP connection (re-established on failure)
     - Background listener thread separates replies (250) from events (650)
     - SETEVENTS CIRC STATUS_CLIENT for push-based monitoring
@@ -72,27 +82,32 @@ class AnonController:
 
         # Connection state
         self._sock = None
+        self._rfile = None                     # buffered reader for the socket
         self._lock = threading.Lock()          # protects _sock writes
-        self._reply_queue = queue.Queue()       # 250/251/... replies
+        self._reply_queue = queue.Queue()      # 250/251/… replies
         self._connected = False
         self._authenticated = False
 
-        # Event state (pushed by anon daemon)
-        self._sse_clients = []                  # list of queue.Queue per SSE client
+        # SSE client management
+        self._sse_clients = []                 # list[queue.Queue] per SSE client
         self._sse_lock = threading.Lock()
 
         # Cached state from events (always up-to-date)
         self._bootstrap = {"progress": 0, "summary": "", "tag": ""}
-        self._circuit_hops = []                 # latest BUILT circuit hops
+        self._circuit_hops = []                # latest BUILT circuit hops
         self._last_circ_id = None
-        self._state_lock = threading.RLock()    # protects cached state
+        self._state_lock = threading.RLock()   # protects cached state
+
+        # Relay IP/country cache  {fingerprint: {ip, cc, name, ts}}
+        self._relay_cache = {}
+        self._relay_cache_ttl = 3600           # 1 h
 
         # Background threads
         self._reader_thread = None
         self._reconnect_thread = None
         self._stop_event = threading.Event()
 
-    # ── Lifecycle ────────────────────────────────────────────
+    # ────────────────── Lifecycle ──────────────────
 
     def start(self):
         """Start the persistent connection (call once at app startup)."""
@@ -101,13 +116,14 @@ class AnonController:
             target=self._reconnect_loop, daemon=True, name="anon-reconnect"
         )
         self._reconnect_thread.start()
+        log.info("AnonController started (reconnect loop running)")
 
     def stop(self):
         """Shut down the persistent connection."""
         self._stop_event.set()
         self._disconnect()
 
-    # ── Connection management ────────────────────────────────
+    # ────────────────── Connection management ──────────────────
 
     def _reconnect_loop(self):
         """Keep trying to (re)connect to the ControlPort."""
@@ -120,43 +136,30 @@ class AnonController:
             self._stop_event.wait(timeout=3)
 
     def _connect(self):
-        """Open TCP connection, authenticate, subscribe to events."""
+        """Establish TCP connection, authenticate, subscribe to events."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
+        sock.settimeout(10)
         sock.connect((self.host, self.port))
-        sock.settimeout(None)  # blocking mode for reader thread
-
+        sock.settimeout(None)
         self._sock = sock
+        self._rfile = sock.makefile("r", encoding="utf-8", errors="replace")
         self._connected = True
-        self._authenticated = False
+        log.info("TCP connected to %s:%s", self.host, self.port)
 
-        # Drain any stale replies
-        while not self._reply_queue.empty():
-            try:
-                self._reply_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        # Start reader thread BEFORE authenticating
+        # Start reader thread BEFORE sending commands
         self._reader_thread = threading.Thread(
             target=self._reader_loop, daemon=True, name="anon-reader"
         )
         self._reader_thread.start()
 
         # Authenticate
-        if not self._authenticate():
-            self._disconnect()
-            return
+        self._authenticate()
 
-        self._authenticated = True
-
-        # Subscribe to events
+        # Subscribe to push events
         self._subscribe_events()
 
-        log.info("ControlPort connected and subscribed to events")
-
     def _disconnect(self):
-        """Close the connection."""
+        """Tear down the TCP connection."""
         self._connected = False
         self._authenticated = False
         if self._sock:
@@ -165,261 +168,287 @@ class AnonController:
             except Exception:
                 pass
             self._sock = None
+        if self._rfile:
+            try:
+                self._rfile.close()
+            except Exception:
+                pass
+            self._rfile = None
+        # Drain reply queue
+        while not self._reply_queue.empty():
+            try:
+                self._reply_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _authenticate(self):
-        """Try cookie auth, then empty password, then bare AUTHENTICATE."""
-        methods = []
-        try:
-            with open(self.cookie_path, "rb") as f:
-                cookie = f.read().hex()
-            methods.append(f"AUTHENTICATE {cookie}")
-        except FileNotFoundError:
-            pass
-        methods += ['AUTHENTICATE ""', "AUTHENTICATE"]
-
-        for m in methods:
-            resp = self._command_raw(m)
-            if resp and resp.startswith("250"):
-                return True
-        return False
-
-    def _subscribe_events(self):
-        """Tell anon to push CIRC and STATUS_CLIENT events."""
-        resp = self._command_raw("SETEVENTS CIRC STATUS_CLIENT")
-        if resp and "250" in resp:
-            log.info("Subscribed to CIRC + STATUS_CLIENT events")
-        else:
-            log.warning("Failed to subscribe to events: %s", resp)
-
-    # ── Reader thread (core of Phase 1) ──────────────────────
-
-    def _reader_loop(self):
-        """Runs in background thread: reads lines from ControlPort,
-        routes replies to _reply_queue, routes events to _handle_event."""
-        buf = b""
-        sock = self._sock
-
-        while self._connected and not self._stop_event.is_set():
+        """Authenticate via COOKIE or password."""
+        cookie_hex = None
+        if os.path.exists(self.cookie_path):
             try:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-
-                # Process complete lines
-                while b"\r\n" in buf:
-                    line_bytes, buf = buf.split(b"\r\n", 1)
-                    line = line_bytes.decode("utf-8", errors="replace")
-
-                    if not line:
-                        continue
-
-                    # 650 = async event from anon
-                    if line.startswith("650"):
-                        self._handle_event(line)
-                    # Multi-line reply continuation (e.g., 250+, 250-)
-                    elif len(line) >= 4 and line[3] == "-":
-                        # accumulate multi-line replies
-                        self._multi_line_buf = getattr(self, "_multi_line_buf", "") + line + "\r\n"
-                    elif len(line) >= 4 and line[3] == " " and line[:3].isdigit():
-                        # Final line of a reply
-                        full = getattr(self, "_multi_line_buf", "") + line
-                        self._multi_line_buf = ""
-                        self._reply_queue.put(full)
-                    else:
-                        # Data line within multi-line (e.g., circuit-status output)
-                        self._multi_line_buf = getattr(self, "_multi_line_buf", "") + line + "\r\n"
-
-            except (ConnectionResetError, BrokenPipeError, OSError):
-                break
-            except Exception as e:
-                log.debug("Reader error: %s", e)
-                break
-
-        self._connected = False
-        log.info("Reader thread exited – will reconnect")
-
-    # ── Event handling ───────────────────────────────────────
-
-    def _handle_event(self, line):
-        """Parse a 650 event line and update cached state + notify SSE clients."""
-        # 650 CIRC <id> <status> [path] [flags...]
-        # 650 STATUS_CLIENT NOTICE BOOTSTRAP PROGRESS=<n> ...
-        event = None
-
-        if "STATUS_CLIENT" in line and "BOOTSTRAP" in line:
-            event = self._parse_bootstrap_event(line)
-
-        elif " CIRC " in line:
-            event = self._parse_circ_event(line)
-
-        if event:
-            self._broadcast_sse(event)
-
-    def _parse_bootstrap_event(self, line):
-        """Parse: 650 STATUS_CLIENT NOTICE BOOTSTRAP PROGRESS=85 TAG=... SUMMARY=..."""
-        progress = 0
-        summary = ""
-        tag = ""
-
-        m = re.search(r"PROGRESS=(\d+)", line)
-        if m:
-            progress = int(m.group(1))
-        m = re.search(r'SUMMARY="([^"]*)"', line)
-        if m:
-            summary = m.group(1)
-        m = re.search(r"TAG=(\S+)", line)
-        if m:
-            tag = m.group(1)
-
-        with self._state_lock:
-            self._bootstrap = {"progress": progress, "summary": summary, "tag": tag}
-
-        if progress >= 100:
-            state = "connected"
-        else:
-            state = "bootstrapping"
-
-        return {
-            "type": "status",
-            "state": state,
-            "progress": progress,
-            "summary": summary or f"Bootstrapping {progress}%",
-        }
-
-    def _parse_circ_event(self, line):
-        """Parse: 650 CIRC <id> <status> [$FP~Name,...] [BUILD_FLAGS=...] [PURPOSE=...]"""
-        parts = line.split()
-        if len(parts) < 4:
-            return None
-
-        # parts: ['650', 'CIRC', '<id>', '<status>', ...]
-        circ_id = parts[2]
-        status = parts[3]
-
-        if status == "BUILT":
-            # Find the path (first token that contains $)
-            path_str = ""
-            for p in parts[4:]:
-                if "$" in p:
-                    path_str = p
-                    break
-
-            if path_str:
-                # Check PURPOSE – prefer GENERAL circuits
-                purpose = ""
-                for p in parts[4:]:
-                    if p.startswith("PURPOSE="):
-                        purpose = p.split("=", 1)[1]
-
-                if purpose not in ("GENERAL", ""):
-                    return None  # skip HS_VANGUARDS etc.
-
-                with self._state_lock:
-                    self._last_circ_id = circ_id
-                    self._circuit_hops = self._parse_path(path_str)
-
-                return {
-                    "type": "circuit",
-                    "status": "BUILT",
-                    "circuit_id": circ_id,
-                    "hops": self._circuit_hops,
-                }
-
-        elif status in ("CLOSED", "FAILED"):
-            with self._state_lock:
-                if circ_id == self._last_circ_id:
-                    self._circuit_hops = []
-                    self._last_circ_id = None
-
-            return {
-                "type": "circuit",
-                "status": status,
-                "circuit_id": circ_id,
-                "hops": [],
-            }
-
-        return None
-
-    def _parse_path(self, path_str):
-        """Parse '$FP~Name,$FP~Name,...' into hop dicts."""
-        hops = []
-        for relay in path_str.split(","):
-            m = re.match(r"\$([0-9A-Fa-f]+)[~=](\S+)", relay)
-            if m:
-                hops.append({
-                    "fingerprint": m.group(1),
-                    "nickname": m.group(2),
-                    "ip": "",
-                    "country_code": "",
-                    "country_name": "",
-                })
-
-        # Assign roles
-        if len(hops) == 1:
-            roles = ["exit"]
-        elif len(hops) == 2:
-            roles = ["entry", "exit"]
-        elif len(hops) >= 3:
-            roles = ["entry"] + ["middle"] * (len(hops) - 2) + ["exit"]
-        else:
-            roles = []
-
-        for i, hop in enumerate(hops):
-            hop["role"] = roles[i] if i < len(roles) else "relay"
-
-        # Enrich with IP + country (best-effort, non-blocking)
-        self._enrich_hops_async(hops)
-
-        return hops
-
-    def _enrich_hops_async(self, hops):
-        """Resolve IP + country for each hop (runs in reader thread context)."""
-        for hop in hops:
-            try:
-                ns = self._command_raw(f'GETINFO ns/id/{hop["fingerprint"]}')
-                if ns:
-                    for nsline in ns.split("\r\n"):
-                        if nsline.startswith("r "):
-                            fields = nsline.split()
-                            if len(fields) >= 7:
-                                hop["ip"] = fields[6]
-                            break
-
-                if hop["ip"]:
-                    cc_resp = self._command_raw(f'GETINFO ip-to-country/{hop["ip"]}')
-                    if cc_resp:
-                        cm = re.search(r"ip-to-country/\S+=(\S+)", cc_resp)
-                        if cm:
-                            cc = cm.group(1).upper()
-                            hop["country_code"] = cc
-                            hop["country_name"] = self.COUNTRY_NAMES.get(cc, cc)
+                with open(self.cookie_path, "rb") as f:
+                    cookie_hex = f.read().hex()
             except Exception:
                 pass
 
-    # ── SSE (Server-Sent Events) broadcast ───────────────────
+        if cookie_hex:
+            resp = self.command(f"AUTHENTICATE {cookie_hex}")
+        else:
+            resp = self.command('AUTHENTICATE ""')
+
+        if resp and "250" in resp:
+            self._authenticated = True
+            log.info("Authenticated to ControlPort")
+        else:
+            log.warning("Authentication failed: %s", resp)
+            raise ConnectionError(f"Auth failed: {resp}")
+
+    def _subscribe_events(self):
+        """Subscribe to CIRC + STATUS_CLIENT events for push updates."""
+        resp = self.command("SETEVENTS CIRC STATUS_CLIENT")
+        if resp and "250" in resp:
+            log.info("Subscribed to CIRC + STATUS_CLIENT events")
+        else:
+            log.warning("SETEVENTS failed: %s", resp)
+
+    # ────────────────── Reader thread ──────────────────
+
+    def _reader_loop(self):
+        """Background thread: read lines from ControlPort, route to queues."""
+        buf = []
+        try:
+            while self._connected and not self._stop_event.is_set():
+                try:
+                    line = self._rfile.readline()
+                except Exception:
+                    break
+                if not line:
+                    break  # EOF — connection lost
+
+                line = line.rstrip("\r\n")
+
+                # Async event lines start with "650"
+                if line.startswith("650"):
+                    # 650-continuation or 650 final
+                    if line.startswith("650-"):
+                        buf.append(line[4:])
+                    else:
+                        # "650 <payload>" — single-line or final line of multi
+                        payload = line[4:] if line.startswith("650 ") else line
+                        buf.append(payload)
+                        full_event = " ".join(buf)
+                        buf = []
+                        self._handle_event(full_event)
+                else:
+                    # Regular reply (250, 251, 515, …)
+                    self._reply_queue.put(line)
+
+        except Exception as e:
+            log.debug("Reader loop exception: %s", e)
+        finally:
+            log.info("Reader loop exited — marking disconnected")
+            self._disconnect()
+
+    # ────────────────── Command interface ──────────────────
+
+    def command(self, cmd, timeout=10):
+        """Send a command and wait for the reply (thread-safe)."""
+        return self._command_raw(cmd, timeout)
+
+    def _command_raw(self, cmd, timeout=10):
+        """Low-level: send command, collect all reply lines until final 250/5xx."""
+        if not self._connected or not self._sock:
+            return None
+        # Drain stale replies
+        while not self._reply_queue.empty():
+            try:
+                self._reply_queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            try:
+                self._sock.sendall((cmd + "\r\n").encode("utf-8"))
+            except Exception:
+                self._disconnect()
+                return None
+
+        # Collect multi-line reply
+        lines = []
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                line = self._reply_queue.get(timeout=min(remaining, 1))
+                lines.append(line)
+                # A line like "250 OK" or "250 …" (without '-') is the final line
+                if re.match(r"^\d{3} ", line):
+                    break
+                # "250-..." means more lines follow
+            except queue.Empty:
+                continue
+        return "\r\n".join(lines) if lines else None
+
+    # ────────────────── Event handling ──────────────────
+
+    def _handle_event(self, event_line):
+        """Process a 650 event from the anon daemon."""
+        parts = event_line.split(" ", 1)
+        if len(parts) < 2:
+            return
+        event_type = parts[0]
+        payload = parts[1]
+
+        if event_type == "STATUS_CLIENT":
+            self._handle_status_event(payload)
+        elif event_type == "CIRC":
+            self._handle_circ_event(payload)
+
+    def _handle_status_event(self, payload):
+        """Handle STATUS_CLIENT events (bootstrap progress)."""
+        m_prog = re.search(r"PROGRESS=(\d+)", payload)
+        m_summ = re.search(r'SUMMARY="([^"]*)"', payload)
+        m_tag = re.search(r"TAG=(\S+)", payload)
+
+        with self._state_lock:
+            if m_prog:
+                self._bootstrap["progress"] = int(m_prog.group(1))
+            if m_summ:
+                self._bootstrap["summary"] = m_summ.group(1)
+            if m_tag:
+                self._bootstrap["tag"] = m_tag.group(1)
+
+        self._broadcast_sse(self._build_status_dict())
+
+    def _handle_circ_event(self, payload):
+        """Handle CIRC events (circuit build / close)."""
+        parts = payload.split()
+        if len(parts) < 2:
+            return
+        circ_id = parts[0]
+        status = parts[1]
+
+        if status == "BUILT" and len(parts) >= 3:
+            path_str = parts[2]
+            # Check for PURPOSE=GENERAL (prefer general-purpose circuits)
+            purpose = ""
+            for p in parts:
+                if p.startswith("PURPOSE="):
+                    purpose = p.split("=", 1)[1]
+            # Only update display for GENERAL circuits (not internal)
+            if purpose and purpose != "GENERAL":
+                return
+
+            hops = self._parse_path(path_str)
+            with self._state_lock:
+                self._circuit_hops = hops
+                self._last_circ_id = circ_id
+
+            self._broadcast_sse({
+                "type": "circuit",
+                "status": "BUILT",
+                "hops": hops,
+            })
+            log.info("Circuit %s BUILT (%d hops)", circ_id, len(hops))
+
+        elif status == "CLOSED" or status == "FAILED":
+            with self._state_lock:
+                if self._last_circ_id == circ_id:
+                    self._circuit_hops = []
+                    self._last_circ_id = None
+                    self._broadcast_sse({
+                        "type": "circuit",
+                        "status": status,
+                        "hops": [],
+                    })
+
+    # ────────────────── Path parsing & relay resolution ──────────────────
+
+    def _parse_path(self, path_str):
+        """Parse '$fingerprint~nickname,$fp2~nick2,…' into a list of hop dicts."""
+        hops = []
+        roles = ["guard", "middle", "exit"]
+        nodes = path_str.split(",")
+        for i, node in enumerate(nodes):
+            fingerprint, nickname = "", ""
+            if "~" in node:
+                fp_part, nickname = node.split("~", 1)
+                fingerprint = fp_part.lstrip("$")
+            else:
+                fingerprint = node.lstrip("$")
+
+            role = roles[i] if i < len(roles) else f"hop{i+1}"
+
+            # Resolve IP + Country (cached)
+            ip, country_code, country_name = self._resolve_relay(fingerprint)
+
+            hops.append({
+                "fingerprint": fingerprint,
+                "nickname": nickname,
+                "role": role,
+                "ip": ip or "",
+                "country_code": country_code or "",
+                "country_name": country_name or "",
+            })
+        return hops
+
+    def _resolve_relay(self, fingerprint):
+        """Get IP and country for a relay via ControlPort (with cache)."""
+        # Check cache first
+        cached = self._relay_cache.get(fingerprint)
+        if cached and (time.time() - cached["ts"]) < self._relay_cache_ttl:
+            return cached["ip"], cached["cc"], cached["name"]
+
+        ip, country_code, country_name = None, None, None
+        try:
+            resp = self.command(f"GETINFO ns/id/{fingerprint}")
+            if resp:
+                for line in resp.split("\r\n"):
+                    if line.startswith("r "):
+                        parts = line.split()
+                        if len(parts) >= 7:
+                            ip = parts[6]
+                        break
+            # Country via ControlPort
+            if ip:
+                cr = self.command(f"GETINFO ip-to-country/{ip}")
+                if cr:
+                    m = re.search(r"ip-to-country/\S+=(\S+)", cr)
+                    if m:
+                        country_code = m.group(1).upper()
+
+            country_name = self.COUNTRY_NAMES.get(country_code, country_code)
+
+            # Update cache
+            self._relay_cache[fingerprint] = {
+                "ip": ip, "cc": country_code, "name": country_name,
+                "ts": time.time(),
+            }
+        except Exception as e:
+            log.debug("Relay resolve failed for %s: %s", fingerprint, e)
+
+        return ip, country_code, country_name
+
+    # ────────────────── SSE broadcast ──────────────────
 
     def add_sse_client(self):
-        """Register a new SSE client, return its queue."""
+        """Register a new SSE client and return its queue."""
         q = queue.Queue(maxsize=50)
         with self._sse_lock:
             self._sse_clients.append(q)
 
-        # Send current state immediately so client doesn't start blank
-        with self._state_lock:
-            status_event = self._build_status_dict()
-            circuit_event = {
-                "type": "circuit",
-                "status": "BUILT" if self._circuit_hops else "NONE",
-                "hops": self._circuit_hops,
-            }
-
+        # Push current state immediately so client is up-to-date
         try:
-            q.put_nowait(status_event)
-            q.put_nowait(circuit_event)
+            q.put_nowait(self._build_status_dict())
         except queue.Full:
             pass
-
+        hops = self.get_circuit_detail()
+        if hops:
+            try:
+                q.put_nowait({"type": "circuit", "status": "BUILT", "hops": hops})
+            except queue.Full:
+                pass
         return q
 
     def remove_sse_client(self, q):
@@ -430,74 +459,49 @@ class AnonController:
             except ValueError:
                 pass
 
-    def _broadcast_sse(self, event):
-        """Push an event to all connected SSE clients."""
+    def _broadcast_sse(self, event_data):
+        """Push event data to all connected SSE clients."""
         with self._sse_lock:
             dead = []
             for q in self._sse_clients:
                 try:
-                    q.put_nowait(event)
+                    q.put_nowait(event_data)
                 except queue.Full:
                     dead.append(q)
             for q in dead:
-                self._sse_clients.remove(q)
+                try:
+                    self._sse_clients.remove(q)
+                except ValueError:
+                    pass
 
-    # ── Command interface (thread-safe) ──────────────────────
-
-    def _command_raw(self, cmd):
-        """Send a command and wait for the reply (250/5xx line)."""
-        with self._lock:
-            if not self._sock or not self._connected:
-                return None
-            try:
-                self._sock.sendall(f"{cmd}\r\n".encode())
-            except (BrokenPipeError, OSError):
-                self._connected = False
-                return None
-
-        # Wait for reply (routed by reader thread)
-        try:
-            return self._reply_queue.get(timeout=10)
-        except queue.Empty:
-            return None
-
-    def command(self, cmd):
-        """Public command interface – auto-reconnects if needed."""
-        if not self._connected or not self._authenticated:
-            return None
-        return self._command_raw(cmd)
-
-    # ── High-level queries (backward-compatible API) ─────────
-
-    def is_running(self):
-        try:
-            subprocess.check_output(["pgrep", "-x", "anon"])
-            return True
-        except Exception:
-            return False
+    # ────────────────── Status helpers ──────────────────
 
     def _build_status_dict(self):
-        """Build status dict from cached state (no ControlPort call needed)."""
-        if not self.is_running():
-            return {"type": "status", "state": "stopped", "progress": 0,
-                    "summary": "Anon is not running"}
-
+        """Build a status dict from cached state (no ControlPort call)."""
         if not self._connected:
             return {"type": "status", "state": "error", "progress": 0,
                     "summary": "Cannot reach control port"}
 
-        bs = self._bootstrap
+        with self._state_lock:
+            bs = dict(self._bootstrap)
+
         if bs["progress"] >= 100:
             return {"type": "status", "state": "connected", "progress": 100,
                     "summary": bs["summary"] or "Connected"}
-        else:
+        elif bs["progress"] > 0:
             return {"type": "status", "state": "bootstrapping",
                     "progress": bs["progress"],
                     "summary": bs["summary"] or f"Bootstrapping {bs['progress']}%"}
+        else:
+            return {"type": "status", "state": "stopped", "progress": 0,
+                    "summary": "Waiting for daemon\u2026"}
+
+    def get_status(self):
+        """Return current status dict (cached, event-driven)."""
+        return self._build_status_dict()
 
     def get_bootstrap(self):
-        """Return cached bootstrap state (no ControlPort call needed).
-        Falls back to active query if no events received yet."""
+        """Return cached bootstrap state. Falls back to active query if needed."""
         with self._state_lock:
             if self._bootstrap["progress"] > 0:
                 return dict(self._bootstrap)
@@ -522,14 +526,8 @@ class AnonController:
 
         return self._bootstrap
 
-    def get_status(self):
-        """Return overall connection state dict (backward-compatible)."""
-        with self._state_lock:
-            return self._build_status_dict()
-
     def get_circuit_detail(self):
-        """Return the latest BUILT circuit hops (backward-compatible).
-        Uses cached hops from events, with fallback to active query."""
+        """Return cached circuit hops (event-driven). Falls back to active query."""
         with self._state_lock:
             if self._circuit_hops:
                 return list(self._circuit_hops)
@@ -538,7 +536,7 @@ class AnonController:
         return self._query_circuit_detail()
 
     def _query_circuit_detail(self):
-        """Active circuit query (fallback only, same logic as v1)."""
+        """Active circuit query (fallback only)."""
         try:
             raw = self.command("GETINFO circuit-status")
             if not raw:
@@ -564,7 +562,6 @@ class AnonController:
                 self._circuit_hops = hops
 
             return hops
-
         except Exception:
             return None
 
@@ -572,7 +569,7 @@ class AnonController:
         """Signal NEWNYM to build fresh circuits."""
         resp = self.command("SIGNAL NEWNYM")
 
-        # Clear cached circuit so UI shows "building..."
+        # Clear cached circuit so UI shows "building…"
         with self._state_lock:
             self._circuit_hops = []
             self._last_circ_id = None
@@ -590,9 +587,9 @@ class AnonController:
 anon_ctrl = AnonController()
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 # Helper functions
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 
 def update_stats():
     global stats
@@ -651,9 +648,9 @@ def set_exit_country(country_code):
     return True
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 # HTML Template
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 
 HTML = """
 <!DOCTYPE html>
@@ -663,154 +660,152 @@ HTML = """
 <title>Anyone Privacy Stick</title>
 <link href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@200..900&display=swap" rel="stylesheet">
 <style>
- :root { --primary:#0280AF; --secondary:#03BDC5; --gradient:linear-gradient(90deg,#0280AF 0%,#03BDC5 100%); --bg:#0b1116; --card:#151b23; --text:#FFF; --dim:#8b949e; --border:#30363d; }
- * { box-sizing:border-box; }
- body { font-family:"Mona Sans",sans-serif; background:var(--bg); color:var(--text); margin:0; padding:20px; display:flex; flex-direction:column; align-items:center; }
- .container { width:100%; max-width:420px; }
- .logo-img { max-width:180px; height:auto; display:block; margin:0 auto 20px; }
- .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:24px; margin-bottom:20px; }
- h3 { font-size:11px; text-transform:uppercase; color:var(--secondary); margin:0 0 15px; font-weight:800; }
+  :root { --primary:#0280AF; --secondary:#03BDC5; --gradient:linear-gradient(90deg,#0280AF 0%,#03BDC5 100%); --bg:#0b1116; --card:#151b23; --text:#FFF; --dim:#8b949e; --border:#30363d; }
+  * { box-sizing:border-box; }
+  body { font-family:"Mona Sans",sans-serif; background:var(--bg); color:var(--text); margin:0; padding:20px; display:flex; flex-direction:column; align-items:center; }
+  .container { width:100%; max-width:420px; }
+  .logo-img { max-width:180px; height:auto; display:block; margin:0 auto 20px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:24px; margin-bottom:20px; }
+  h3 { font-size:11px; text-transform:uppercase; color:var(--secondary); margin:0 0 15px; font-weight:800; }
 
- /* Status badge */
- .status-indicator { display:flex; align-items:center; justify-content:center; padding:15px; border-radius:8px; font-weight:600; margin-bottom:20px; background:rgba(255,255,255,0.03); }
- .dot { height:8px; width:8px; border-radius:50%; margin-right:12px; background:#555; flex-shrink:0; }
- .active .dot { background:var(--secondary); box-shadow:0 0 12px var(--secondary); }
+  /* Status badge */
+  .status-indicator { display:flex; align-items:center; justify-content:center; padding:15px; border-radius:8px; font-weight:600; margin-bottom:20px; background:rgba(255,255,255,0.03); }
+  .dot { height:8px; width:8px; border-radius:50%; margin-right:12px; background:#555; flex-shrink:0; }
+  .active .dot { background:var(--secondary); box-shadow:0 0 12px var(--secondary); }
 
- /* Connection status */
- .conn-badge { display:inline-flex; align-items:center; gap:8px; padding:8px 14px; border-radius:8px; font-weight:700; font-size:13px; }
- .conn-badge.stopped { background:rgba(248,81,73,0.12); color:#f85149; }
- .conn-badge.bootstrapping { background:rgba(210,153,34,0.12); color:#d2992a; }
- .conn-badge.connected { background:rgba(3,189,197,0.12); color:var(--secondary); }
- .conn-badge.error { background:rgba(248,81,73,0.12); color:#f85149; }
- .conn-dot { height:8px; width:8px; border-radius:50%; flex-shrink:0; }
- .stopped .conn-dot { background:#f85149; }
- .bootstrapping .conn-dot { background:#d2992a; animation:pulse 1.2s infinite; }
- .connected .conn-dot { background:var(--secondary); box-shadow:0 0 10px var(--secondary); }
- .error .conn-dot { background:#f85149; }
- @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
- .progress-bar-bg { width:100%; height:6px; background:rgba(255,255,255,0.06); border-radius:3px; margin-top:14px; overflow:hidden; }
- .progress-bar-fill { height:100%; border-radius:3px; background:var(--gradient); transition:width .6s ease; }
- .conn-summary { font-size:12px; color:var(--dim); margin-top:8px; }
+  /* Connection status */
+  .conn-badge { display:inline-flex; align-items:center; gap:8px; padding:8px 14px; border-radius:8px; font-weight:700; font-size:13px; }
+  .conn-badge.stopped { background:rgba(248,81,73,0.12); color:#f85149; }
+  .conn-badge.bootstrapping { background:rgba(210,153,34,0.12); color:#d2992a; }
+  .conn-badge.connected { background:rgba(3,189,197,0.12); color:var(--secondary); }
+  .conn-badge.error { background:rgba(248,81,73,0.12); color:#f85149; }
+  .conn-dot { height:8px; width:8px; border-radius:50%; flex-shrink:0; }
+  .stopped .conn-dot { background:#f85149; }
+  .bootstrapping .conn-dot { background:#d2992a; animation:pulse 1.2s infinite; }
+  .connected .conn-dot { background:var(--secondary); box-shadow:0 0 10px var(--secondary); }
+  .error .conn-dot { background:#f85149; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .progress-bar-bg { width:100%; height:6px; background:rgba(255,255,255,0.06); border-radius:3px; margin-top:14px; overflow:hidden; }
+  .progress-bar-fill { height:100%; border-radius:3px; background:var(--gradient); transition:width .6s ease; }
+  .conn-summary { font-size:12px; color:var(--dim); margin-top:8px; }
 
- /* Circuit chain */
- .circuit-chain { display:flex; align-items:stretch; justify-content:center; gap:0; margin:10px 0; }
- .circuit-node { flex:1; background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:10px; padding:12px 8px; text-align:center; min-width:0; }
- .circuit-node.active-node { border-color:var(--secondary); background:rgba(3,189,197,0.06); }
- .node-role { font-size:9px; font-weight:800; text-transform:uppercase; color:var(--secondary); margin-bottom:6px; letter-spacing:0.5px; }
- .node-flag { font-size:26px; line-height:1; margin-bottom:4px; }
- .node-name { font-size:11px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
- .node-ip { font-size:10px; color:var(--dim); font-family:monospace; margin-top:2px; }
- .node-country { font-size:10px; color:var(--dim); margin-top:1px; }
- .circuit-arrow { display:flex; align-items:center; padding:0 4px; font-size:16px; color:var(--secondary); font-weight:700; }
- .circuit-empty { text-align:center; color:var(--dim); font-size:12px; padding:20px 0; }
- .btn-sm { padding:10px 16px; font-size:12px; border-radius:6px; font-weight:700; cursor:pointer; border:none; font-family:inherit; margin-top:12px; }
+  /* Circuit chain */
+  .circuit-chain { display:flex; align-items:stretch; justify-content:center; gap:0; margin:10px 0; }
+  .circuit-node { flex:1; background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:10px; padding:12px 8px; text-align:center; min-width:0; }
+  .circuit-node.active-node { border-color:var(--secondary); background:rgba(3,189,197,0.06); }
+  .node-role { font-size:9px; font-weight:800; text-transform:uppercase; color:var(--secondary); margin-bottom:6px; letter-spacing:0.5px; }
+  .node-flag { font-size:26px; line-height:1; margin-bottom:4px; }
+  .node-name { font-size:11px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .node-ip { font-size:10px; color:var(--dim); font-family:monospace; margin-top:2px; }
+  .node-country { font-size:10px; color:var(--dim); margin-top:1px; }
+  .circuit-arrow { display:flex; align-items:center; padding:0 4px; font-size:16px; color:var(--secondary); font-weight:700; }
+  .circuit-empty { text-align:center; color:var(--dim); font-size:12px; padding:20px 0; }
+  .btn-sm { padding:10px 16px; font-size:12px; border-radius:6px; font-weight:700; cursor:pointer; border:none; font-family:inherit; margin-top:12px; }
 
- /* Traffic */
- .traffic-grid { display:grid; grid-template-columns:1fr 1fr; gap:15px; }
- .traffic-val { font-size:18px; font-weight:700; }
- .traffic-speed { font-size:11px; color:var(--secondary); font-weight:600; }
+  /* Traffic */
+  .traffic-grid { display:grid; grid-template-columns:1fr 1fr; gap:15px; }
+  .traffic-val { font-size:18px; font-weight:700; }
+  .traffic-speed { font-size:11px; color:var(--secondary); font-weight:600; }
 
- /* Buttons */
- button { width:100%; padding:16px; border:none; border-radius:8px; font-size:14px; font-weight:700; cursor:pointer; transition:.2s; font-family:inherit; }
- button:disabled { opacity:.5; cursor:not-allowed; }
- .btn-primary { background:var(--gradient); color:#fff; }
- .btn-secondary { background:#21262d; color:#fff; border:1px solid var(--border); }
+  /* Buttons */
+  button { width:100%; padding:16px; border:none; border-radius:8px; font-size:14px; font-weight:700; cursor:pointer; transition:.2s; font-family:inherit; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .btn-primary { background:var(--gradient); color:#fff; }
+  .btn-secondary { background:#21262d; color:#fff; border:1px solid var(--border); }
 
- /* Wi-Fi / Forms */
- .wifi-item { padding:12px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; justify-content:space-between; font-size:14px; }
- .connected-label { color:var(--secondary); font-weight:800; font-size:10px; border:1px solid var(--secondary); padding:2px 6px; border-radius:4px; }
- input,select { width:100%; padding:14px; background:#0d1117; border:1px solid var(--border); border-radius:8px; color:#fff; margin:10px 0; font-family:inherit; font-size:14px; }
- select { appearance:none; -webkit-appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238b949e' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 14px center; cursor:pointer; }
- select option { background:#0d1117; color:#fff; }
- .helper-text { font-size:11px; color:var(--dim); margin-top:4px; }
- .circuit-status { display:flex; align-items:center; gap:8px; margin-bottom:15px; padding:10px; border-radius:6px; font-size:12px; font-weight:600; }
- .circuit-status.active { background:rgba(3,189,197,0.08); color:var(--secondary); }
- .circuit-status.inactive { background:rgba(255,255,255,0.03); color:var(--dim); }
+  /* Wi-Fi / Forms */
+  .wifi-item { padding:12px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; justify-content:space-between; font-size:14px; }
+  .connected-label { color:var(--secondary); font-weight:800; font-size:10px; border:1px solid var(--secondary); padding:2px 6px; border-radius:4px; }
+  input,select { width:100%; padding:14px; background:#0d1117; border:1px solid var(--border); border-radius:8px; color:#fff; margin:10px 0; font-family:inherit; font-size:14px; }
+  select { appearance:none; -webkit-appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238b949e' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 14px center; cursor:pointer; }
+  select option { background:#0d1117; color:#fff; }
+  .helper-text { font-size:11px; color:var(--dim); margin-top:4px; }
+  .circuit-status { display:flex; align-items:center; gap:8px; margin-bottom:15px; padding:10px; border-radius:6px; font-size:12px; font-weight:600; }
+  .circuit-status.active { background:rgba(3,189,197,0.08); color:var(--secondary); }
+  .circuit-status.inactive { background:rgba(255,255,255,0.03); color:var(--dim); }
 
- /* SSE connection indicator */
- .sse-dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-left:8px; vertical-align:middle; }
- .sse-dot.live { background:#03BDC5; box-shadow:0 0 6px #03BDC5; }
- .sse-dot.dead { background:#f85149; }
+  /* SSE connection indicator */
+  .sse-dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-left:8px; vertical-align:middle; }
+  .sse-dot.live { background:#03BDC5; box-shadow:0 0 6px #03BDC5; }
+  .sse-dot.dead { background:#f85149; }
 </style>
 </head>
 <body>
 <div class="container">
- <img src="/static/logo.jpg" onerror="this.src='/static/logo.png'" class="logo-img">
+  <img src="/static/logo.jpg" onerror="this.src='/static/logo.png'" class="logo-img">
 
- <!-- Connection Status -->
- <div class="card">
-   <h3>Anyone Connection <span class="sse-dot dead" id="sse-dot" title="Live Events"></span></h3>
-   <div id="conn-badge" class="conn-badge stopped">
-     <div class="conn-dot"></div>
-     <span id="conn-label">Checking…</span>
-   </div>
-   <div class="progress-bar-bg"><div class="progress-bar-fill" id="conn-progress" style="width:0%"></div></div>
-   <div class="conn-summary" id="conn-summary">Waiting for status…</div>
- </div>
+  <!-- Connection Status -->
+  <div class="card">
+    <h3>Anyone Connection <span class="sse-dot dead" id="sse-dot" title="Live Events"></span></h3>
+    <div id="conn-badge" class="conn-badge stopped">
+      <div class="conn-dot"></div>
+      <span id="conn-label">Checking\u2026</span>
+    </div>
+    <div class="progress-bar-bg"><div class="progress-bar-fill" id="conn-progress" style="width:0%"></div></div>
+    <div class="conn-summary" id="conn-summary">Waiting for status\u2026</div>
+  </div>
 
- <!-- Circuit Chain -->
- <div class="card">
-   <h3>Circuit Chain</h3>
-   <div id="circuit-container">
-     <div class="circuit-empty">No circuit available</div>
-   </div>
-   <button class="btn-sm btn-secondary" style="width:auto" onclick="newCircuit()" id="newnym-btn">&#x1f504; New Circuit</button>
- </div>
+  <!-- Circuit Chain -->
+  <div class="card">
+    <h3>Circuit Chain</h3>
+    <div id="circuit-container">
+      <div class="circuit-empty">No circuit available</div>
+    </div>
+    <button class="btn-sm btn-secondary" style="width:auto" onclick="newCircuit()" id="newnym-btn">&#x1f504; New Circuit</button>
+  </div>
 
- <!-- Mode Switch -->
- <div class="card">
-   <h3>Mode</h3>
-   <div class="status-indicator {{ 'active' if privacy else '' }}"><div class="dot"></div>{{ 'PRIVACY ACTIVE' if privacy else 'NORMAL MODE' }}</div>
-   <form action="/mode/{{ 'normal' if privacy else 'privacy' }}" method="post"><button class="{{ 'btn-secondary' if privacy else 'btn-primary' }}">{{ 'Switch to Normal' if privacy else 'Enable Privacy' }}</button></form>
- </div>
+  <!-- Mode Switch -->
+  <div class="card">
+    <h3>Mode</h3>
+    <div class="status-indicator {{ 'active' if privacy else '' }}"><div class="dot"></div>{{ 'PRIVACY ACTIVE' if privacy else 'NORMAL MODE' }}</div>
+    <form action="/mode/{{ 'normal' if privacy else 'privacy' }}" method="post"><button class="{{ 'btn-secondary' if privacy else 'btn-primary' }}">{{ 'Switch to Normal' if privacy else 'Enable Privacy' }}</button></form>
+  </div>
 
- <!-- Live Traffic -->
- <div class="card">
-   <h3>Live Traffic</h3>
-   <div class="traffic-grid">
-     <div><div style="font-size:10px;color:var(--dim)">DOWNLOAD</div><div class="traffic-val" id="rx">0 MB</div><div class="traffic-speed" id="s_rx">0 KB/s</div></div>
-     <div><div style="font-size:10px;color:var(--dim)">UPLOAD</div><div class="traffic-val" id="tx">0 MB</div><div class="traffic-speed" id="s_tx">0 KB/s</div></div>
-   </div>
- </div>
+  <!-- Live Traffic -->
+  <div class="card">
+    <h3>Live Traffic</h3>
+    <div class="traffic-grid">
+      <div><div style="font-size:10px;color:var(--dim)">DOWNLOAD</div><div class="traffic-val" id="rx">0 MB</div><div class="traffic-speed" id="s_rx">0 KB/s</div></div>
+      <div><div style="font-size:10px;color:var(--dim)">UPLOAD</div><div class="traffic-val" id="tx">0 MB</div><div class="traffic-speed" id="s_tx">0 KB/s</div></div>
+    </div>
+  </div>
 
- <!-- Exit Country -->
- <div class="card">
-   <h3>Exit Country</h3>
-   <div class="circuit-status {{ 'active' if privacy and exit_country != 'auto' else 'inactive' }}" id="circuit-status">
-     {{ '\U0001f512 Exit: ' + exit_country.upper() if exit_country != 'auto' else '\U0001f30d Automatic exit selection' }}
-   </div>
-   <select id="exit-select" onchange="setExit(this.value)">
-     {% for code, name in countries %}
-     <option value="{{ code }}" {{ 'selected' if code == exit_country else '' }}>{{ name }}</option>
-     {% endfor %}
-   </select>
-   <div class="helper-text">Requires Privacy Mode. Changing country rebuilds circuits.</div>
- </div>
+  <!-- Exit Country -->
+  <div class="card">
+    <h3>Exit Country</h3>
+    <div class="circuit-status {{ 'active' if privacy and exit_country != 'auto' else 'inactive' }}" id="circuit-status">
+      {{ '\U0001f512 Exit: ' + exit_country.upper() if exit_country != 'auto' else '\U0001f30d Automatic exit selection' }}
+    </div>
+    <select id="exit-select" onchange="setExit(this.value)">
+      {% for code, name in countries %}
+      <option value="{{ code }}" {{ 'selected' if code == exit_country else '' }}>{{ name }}</option>
+      {% endfor %}
+    </select>
+    <div class="helper-text">Requires Privacy Mode. Changing country rebuilds circuits.</div>
+  </div>
 
- <!-- Wi-Fi -->
- <div class="card">
-   <h3>Wi-Fi</h3>
-   <button class="btn-secondary" id="scan-btn" onclick="scan()">Scan Networks</button>
-   <div id="list" style="margin-top:10px"></div>
-   <div id="connect" style="display:none;margin-top:15px">
-     <div style="font-weight:600" id="ssid-name"></div>
-     <input type="password" id="pw" placeholder="Password">
-     <button class="btn-primary" id="conn-btn" onclick="connectWifi()">Connect Now</button>
-   </div>
- </div>
+  <!-- Wi-Fi -->
+  <div class="card">
+    <h3>Wi-Fi</h3>
+    <button class="btn-secondary" id="scan-btn" onclick="scan()">Scan Networks</button>
+    <div id="list" style="margin-top:10px"></div>
+    <div id="connect" style="display:none;margin-top:15px">
+      <div style="font-weight:600" id="ssid-name"></div>
+      <input type="password" id="pw" placeholder="Password">
+      <button class="btn-primary" id="conn-btn" onclick="connectWifi()">Connect Now</button>
+    </div>
+  </div>
 </div>
 
 <script>
 let targetSSID = '';
 
 function flag(cc) {
- if (!cc || cc.length !== 2) return '\u2014';
- return String.fromCodePoint(...[...cc.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
+  if (!cc || cc.length !== 2) return '\u2014';
+  return String.fromCodePoint(...[...cc.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
 }
 
-// ═══════════════════════════════════════════════════════════
-// SSE – Server-Sent Events (replaces polling for status + circuit)
-// ═══════════════════════════════════════════════════════════
+// ──────── SSE — Server-Sent Events (replaces polling for status + circuit) ────────
 
 let evtSource = null;
 let sseRetryTimeout = null;
@@ -837,12 +832,11 @@ function connectSSE() {
   evtSource.onerror = () => {
     dot.className = 'sse-dot dead';
     evtSource.close();
-    // Reconnect after 3s
     sseRetryTimeout = setTimeout(connectSSE, 3000);
   };
 }
 
-// ── Status update (from SSE event) ──────────────────────
+// Status update (from SSE event)
 
 function updateStatus(d) {
   const badge = document.getElementById('conn-badge');
@@ -860,7 +854,7 @@ function updateStatus(d) {
   summ.innerText = d.summary || '';
 }
 
-// ── Circuit update (from SSE event) ─────────────────────
+// Circuit update (from SSE event)
 
 function updateCircuit(d) {
   const c = document.getElementById('circuit-container');
@@ -890,20 +884,19 @@ function updateCircuit(d) {
   c.innerHTML = html;
 }
 
-// ── New circuit request ─────────────────────────────────
+// New circuit request
 
 async function newCircuit() {
   const btn = document.getElementById('newnym-btn');
-  btn.disabled = true; btn.innerText = '\u23F3 Requesting…';
+  btn.disabled = true; btn.innerText = '\u23F3 Requesting\u2026';
   try {
     await fetch('/api/anon/newcircuit', {method:'POST'});
-    // No need to poll – SSE will push the new circuit
   } finally {
-    setTimeout(() => { btn.disabled = false; btn.innerHTML = '\U0001f504 New Circuit'; }, 2000);
+    setTimeout(() => { btn.disabled = false; btn.innerHTML = '&#x1f504; New Circuit'; }, 2000);
   }
 }
 
-// ── Exit country ────────────────────────────────────────
+// Exit country
 
 async function setExit(cc) {
   try {
@@ -914,10 +907,10 @@ async function setExit(cc) {
     const d = await r.json();
     if (d.status !== 'ok') alert(d.status);
     else location.reload();
-  } catch(e) { alert('Error setting exit country'); }
+  } catch(e) { alert('Error'); }
 }
 
-// ── Traffic polling (still polled – 1s, too frequent for SSE) ──
+// Traffic polling (1s)
 
 async function pollTraffic() {
   try {
@@ -929,10 +922,10 @@ async function pollTraffic() {
   } catch(e) {}
 }
 
-// ── Wi-Fi ───────────────────────────────────────────────
+// Wi-Fi
 
 async function scan() {
-  const btn=document.getElementById('scan-btn'); btn.disabled=true; btn.innerText='Scanning…';
+  const btn=document.getElementById('scan-btn'); btn.disabled=true; btn.innerText='Scanning\u2026';
   document.getElementById('list').innerHTML='';
   try {
     const r=await fetch('/wifi/scan'); const d=await r.json();
@@ -947,7 +940,7 @@ async function scan() {
 function sel(s){ targetSSID=s; document.getElementById('ssid-name').innerText=s; document.getElementById('connect').style.display='block'; }
 async function connectWifi(){
   const btn=document.getElementById('conn-btn'), pw=document.getElementById('pw').value;
-  btn.disabled=true; btn.innerText='Connecting…';
+  btn.disabled=true; btn.innerText='Connecting\u2026';
   try {
     const r=await fetch('/wifi/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:targetSSID,password:pw})});
     const d=await r.json(); alert(d.status);
@@ -956,9 +949,7 @@ async function connectWifi(){
   finally { btn.disabled=false; btn.innerText='Connect Now'; }
 }
 
-// ═══════════════════════════════════════════════════════════
-// Start: SSE for status+circuit, polling only for traffic
-// ═══════════════════════════════════════════════════════════
+// ──── Start: SSE for status+circuit, polling only for traffic ────
 connectSSE();
 pollTraffic();
 setInterval(pollTraffic, 1000);
@@ -967,9 +958,9 @@ setInterval(pollTraffic, 1000);
 """
 
 
-# ═══════════════════════════════════════════════════════════════
-# Routes
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
+# Flask Routes
+# ============================================================================
 
 @app.route("/")
 def index():
@@ -979,17 +970,17 @@ def index():
     return render_template_string(HTML, privacy=p, exit_country=ec, countries=EXIT_COUNTRIES)
 
 
-# ── SSE endpoint (replaces status + circuit polling) ─────
+# ──── SSE endpoint (replaces status + circuit polling) ────
 
 @app.route("/api/events")
 def sse_events():
-    """Server-Sent Events stream – pushes status + circuit updates in real-time."""
+    """Server-Sent Events stream — pushes status + circuit updates in real-time."""
     def generate():
         q = anon_ctrl.add_sse_client()
         try:
             while True:
                 try:
-                    event = q.get(timeout=30)
+                    event = q.get(timeout=15)
                     yield f"data: {json.dumps(event)}\n\n"
                 except queue.Empty:
                     # Send keepalive comment to prevent proxy/browser timeout
@@ -1010,16 +1001,16 @@ def sse_events():
     )
 
 
-# ── Backward-compatible REST endpoints (still work) ──────
+# ──── REST API ────
+
+@app.route("/api/status")
+def api_status():
+    return jsonify(anon_ctrl.get_status())
+
 
 @app.route("/api/traffic")
-def traffic():
+def api_traffic():
     return jsonify(update_stats())
-
-
-@app.route("/api/anon/status")
-def api_anon_status():
-    return jsonify(anon_ctrl.get_status())
 
 
 @app.route("/api/anon/circuit")
@@ -1057,7 +1048,7 @@ def post_circuit():
     return jsonify({"status": "ok", "exit_country": cc})
 
 
-# ── Wi-Fi ────────────────────────────────────────────────
+# ──── Wi-Fi ────
 
 @app.route("/wifi/scan")
 def w_scan():
@@ -1100,9 +1091,9 @@ def mode_normal():
     return redirect("/")
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 # Startup
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 
 # Start persistent ControlPort connection
 anon_ctrl.start()
