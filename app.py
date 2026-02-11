@@ -907,6 +907,131 @@ HTML = """
 </style>
 </head>
 <body>
+
+  <div id="killswitch-panel" style="position:sticky;top:0;z-index:9999;padding:10px 12px;background:rgba(20,20,20,.95);border-bottom:1px solid rgba(255,255,255,.08);">
+    <div style="display:flex;gap:12px;align-items:center;justify-content:space-between;max-width:1100px;margin:0 auto;">
+      <div style="display:flex;flex-direction:column;gap:2px;">
+        <div style="font-weight:700;font-size:14px;letter-spacing:.2px;">Kill Switch</div>
+        <div id="killswitch-sub" style="opacity:.85;font-size:12px;">Blocks all non-local traffic from the Stick (Normal + Privacy mode).</div>
+      </div>
+      <button id="killswitch-btn" type="button"
+        style="padding:10px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.15);font-weight:700;cursor:pointer;min-width:170px;">
+        Kill Switch: …
+      
+
+</button>
+<script id="ks-js-proof">
+(function(){
+  const btn = document.getElementById('killswitch-btn');
+  const sub = document.getElementById('killswitch-sub');
+  if(!btn) return;
+
+  function uiTemp(){
+    btn.textContent = 'Kill Switch: …';
+    btn.style.background = 'rgba(255,255,255,.08)';
+    btn.style.borderColor = 'rgba(255,255,255,.15)';
+    btn.style.color = '#fff';
+    if(sub) sub.textContent = 'Loading status…';
+  }
+
+  function uiErr(msg){
+    btn.textContent = 'Kill Switch: error';
+    btn.style.background = 'rgba(255,255,255,.08)';
+    btn.style.borderColor = 'rgba(255,255,255,.15)';
+    btn.style.color = '#fff';
+    if(sub) sub.textContent = 'Kill Switch error: ' + msg;
+  }
+
+  function uiOk(on){
+    btn.textContent = on ? 'Kill Switch: ON' : 'Kill Switch: OFF';
+    btn.style.background = on ? 'rgba(220, 38, 38, .95)' : 'rgba(34, 197, 94, .20)';
+    btn.style.borderColor = on ? 'rgba(220, 38, 38, .8)' : 'rgba(34, 197, 94, .35)';
+    btn.style.color = '#fff';
+    if(sub){
+      sub.textContent = on
+        ? 'Egress is blocked. Only local management traffic is allowed.'
+        : 'Blocks all non-local traffic from the Stick (Normal + Privacy mode).';
+    }
+  }
+
+  async function fetchJson(url, timeoutMs){
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try{
+      const r = await fetch(url, { cache:'no-store', signal: ctl.signal });
+      const ct = (r.headers.get('content-type') || '').toLowerCase();
+      const txt = await r.text();
+      if(!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+      if(!ct.includes('application/json')) {
+        // show first chars to debug
+        throw new Error('Non-JSON response (' + ct + '): ' + txt.slice(0,120));
+      }
+      return JSON.parse(txt);
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  async function refresh(){
+    try{
+      const st = await fetchJson('/api/killswitch/status', 2500);
+      uiOk(!!st.enabled);
+      return !!st.enabled;
+    } catch(e){
+      uiErr((e && e.name === 'AbortError') ? 'timeout fetching /api/killswitch/status' : (e && e.message ? e.message : String(e)));
+      return null;
+    }
+  }
+
+  async function setEnabled(enabled){
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 2500);
+    try{
+      const r = await fetch('/api/killswitch/set', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ enabled }),
+        signal: ctl.signal
+      });
+      if(!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  function bindOnce(){
+    if(btn.dataset.ksBound === "1") return;
+    btn.dataset.ksBound = "1";
+
+    btn.addEventListener('click', async () => {
+      const cur = await refresh();
+      const target = !cur;
+
+      if(target){
+        const ok = confirm('Enable Kill Switch?
+
+This blocks all non-local traffic from the Stick (Normal + Privacy mode).');
+        if(!ok) return;
+      }
+
+      uiTemp();
+      try{ await setEnabled(target); } catch(e){
+        uiErr((e && e.name === 'AbortError') ? 'timeout calling /api/killswitch/set' : (e && e.message ? e.message : String(e)));
+        return;
+      }
+      await refresh();
+    });
+  }
+
+  uiTemp();
+  bindOnce();
+  refresh();
+  setInterval(refresh, 2500);
+})();
+</script>
+
+</div>
+  </div>
 <div class="container">
   <img src="/static/logo.png" onerror="this.src='/static/logo.png'" class="logo-img">
 
@@ -1166,20 +1291,25 @@ function updateProofBanner(st) {
   const sub = document.getElementById('proof-sub');
   if (!b || !sub) return;
 
-  const connected = !!(st && st.connected);
-  const ip = (st && st.ip) ? st.ip : '';
-  const reason = (st && st.reason) ? st.reason : 'unknown';
   const privacy = !!(st && st.privacy);
+
+  // Backward compatible:
+  // - preferred: st.display_connected (server says UI-safe connected)
+  // - fallback: st.connected && st.privacy
+  const connected = !!(st && (st.display_connected ?? (st.connected && privacy)));
+
+  const ip = (st && st.ip) ? st.ip : '';
 
   b.className = 'proof-banner ' + (connected ? 'connected' : 'disconnected');
   b.firstChild.nodeValue = connected ? 'Connected to Anyone' : 'Not connected to Anyone';
 
   let msg = '';
   if (!privacy) msg += 'Privacy mode is OFF. ';
-  if (ip) msg += `Exit IP: ${ip}. `;
+  if (privacy && ip) msg += `Exit IP: ${ip}. `;
   
   sub.textContent = msg.trim();
 }
+
 
 async function pollProof() {
   try {
@@ -1356,6 +1486,167 @@ document.addEventListener("DOMContentLoaded", () => {
   <span class="proof-sub" id="proof-sub">Checking…</span>
 </div>
 
+
+
+<script>
+// -----------------------------
+// Kill Switch UI (robust init)
+// -----------------------------
+async function refreshKillSwitch__disabled() {
+  const btn = document.getElementById('killswitch-btn');
+  const sub = document.getElementById('killswitch-sub');
+  if (!btn) return;
+
+  try {
+    const r = await fetch('/api/killswitch/status', { cache: 'no-store' });
+    const st = await r.json();
+    const on = !!st.enabled;
+
+    btn.textContent = on ? 'Kill Switch: ON' : 'Kill Switch: OFF';
+    btn.style.background = on ? 'rgba(220, 38, 38, .95)' : 'rgba(34, 197, 94, .20)';
+    btn.style.borderColor = on ? 'rgba(220, 38, 38, .8)' : 'rgba(34, 197, 94, .35)';
+    btn.style.color = '#fff';
+
+    if (sub) {
+      sub.textContent = on
+        ? 'Egress is blocked. Only local management traffic is allowed.'
+        : 'Blocks all non-local traffic from the Stick (Normal + Privacy mode).';
+    }
+  } catch (e) {
+    btn.textContent = 'Kill Switch: error';
+    btn.style.background = 'rgba(255, 255, 255, .08)';
+  }
+}
+
+async function setKillSwitch(enabled) {
+  const r = await fetch('/api/killswitch/set', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled })
+  });
+  return await r.json();
+}
+
+function initKillSwitchUI() {
+  const btn = document.getElementById('killswitch-btn');
+  if (!btn) return;
+
+  // avoid double-binding if init runs multiple times
+  if (btn.dataset.ksBound === "1") {
+    refreshKillSwitch();
+    return;
+  }
+  btn.dataset.ksBound = "1";
+
+  btn.addEventListener('click', async () => {
+    let cur = false;
+    try {
+      const r = await fetch('/api/killswitch/status', { cache: 'no-store' });
+      const st = await r.json();
+      cur = !!st.enabled;
+    } catch (e) {}
+
+    const target = !cur;
+
+    if (target) {
+      const ok = confirm('Enable Kill Switch?\n\nThis blocks all non-local traffic from the Stick (Normal + Privacy mode).');
+      if (!ok) return;
+    }
+
+    try { await setKillSwitch(target); } catch (e) {}
+    await refreshKillSwitch();
+  });
+
+  refreshKillSwitch();
+  setInterval(refreshKillSwitch, 2500);
+}
+
+// Robust init: if DOMContentLoaded already fired, run immediately
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initKillSwitchUI);
+} else {
+  initKillSwitchUI();
+}
+</script>
+
+<script id="ks-js2-proof">
+(function(){
+  function run(){
+    const btn = document.getElementById('killswitch-btn');
+    const sub = document.getElementById('killswitch-sub');
+    if(!btn) return false;
+
+    async function refresh(){
+      try{
+        const url = (location && location.origin ? location.origin : '') + '/api/killswitch/status';
+        const r = await fetch(url, { cache: 'no-store' });
+        const txt = await r.text();
+        if(!r.ok) throw new Error('HTTP ' + r.status);
+        const st = JSON.parse(txt);
+        const on = !!st.enabled;
+
+        btn.textContent = on ? 'Kill Switch: ON' : 'Kill Switch: OFF';
+        btn.style.background = on ? 'rgba(220, 38, 38, .95)' : 'rgba(34, 197, 94, .20)';
+        btn.style.borderColor = on ? 'rgba(220, 38, 38, .8)' : 'rgba(34, 197, 94, .35)';
+        btn.style.color = '#fff';
+
+        if(sub){
+          sub.textContent = on
+            ? 'Egress is blocked. Only local management traffic is allowed.'
+            : 'Blocks all non-local traffic from the Stick (Normal + Privacy mode).';
+        }
+      } catch(e){
+        btn.textContent = 'Kill Switch: error';
+        if(sub) sub.textContent = 'JS error: ' + (e && e.message ? e.message : String(e));
+      }
+    }
+
+    // bind click once
+    if(btn.dataset.ksBound !== "1"){
+      btn.dataset.ksBound = "1";
+      btn.addEventListener('click', async () => {
+        // read current
+        let cur = false;
+        try{
+          const r = await fetch((location.origin || '') + '/api/killswitch/status', { cache:'no-store' });
+          const st = await r.json();
+          cur = !!st.enabled;
+        } catch(e){}
+
+        const target = !cur;
+        if(target){
+          const ok = confirm('Enable Kill Switch?
+
+This blocks all non-local traffic from the Stick (Normal + Privacy mode).');
+          if(!ok) return;
+        }
+
+        try{
+          await fetch((location.origin || '') + '/api/killswitch/set', {
+            method:'POST',
+            headers:{ 'Content-Type':'application/json' },
+            body: JSON.stringify({ enabled: target })
+          });
+        } catch(e){}
+
+        await refresh();
+      });
+    }
+
+    refresh();
+    setInterval(refresh, 2500);
+    return true;
+  }
+
+  // Wait until button exists (DOM timing safe)
+  let tries = 0;
+  const t = setInterval(() => {
+    tries++;
+    if (run() || tries > 100) clearInterval(t); // ~10s max
+  }, 100);
+})();
+</script>
+
 </body></html>
 """
 
@@ -1486,9 +1777,11 @@ def api_rotation_trigger():
 @app.route("/api/anyone/proof", methods=["GET"])
 def api_anyone_proof():
     st = _anyone_proof_check()
-    # also refresh leakcheck periodically (cheap enough)
+    privacy = _privacy_mode_active()
     st2 = dict(st)
-    st2.update({"privacy": _privacy_mode_active()})
+    st2.update({"privacy": bool(privacy)})
+    # UI must only claim 'Connected to Anyone' when Privacy Mode is actually active
+    st2["display_connected"] = bool(st2.get("connected")) and bool(privacy)
     return jsonify(st2), 200
 
 # ──── Debug helpers ────
@@ -1600,3 +1893,35 @@ rotation_mgr.start()
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=80, threaded=True)
 
+
+
+# -----------------------------
+# Kill Switch (block all egress)
+# -----------------------------
+KILLSWITCH_SCRIPT = "/usr/local/bin/anyone_killswitch.sh"
+
+def _killswitch_get():
+    try:
+        import subprocess
+        # run as root via sudo (web app user is typically www-data)
+        out = subprocess.check_output(["sudo", KILLSWITCH_SCRIPT, "status"], stderr=subprocess.STDOUT, text=True).strip()
+        return (out.upper() == "ON")
+    except Exception:
+        return False
+
+def _killswitch_set(enabled: bool):
+    import subprocess
+    cmd = "on" if enabled else "off"
+    out = subprocess.check_output(["sudo", KILLSWITCH_SCRIPT, cmd], stderr=subprocess.STDOUT, text=True).strip()
+    return (out.upper() == "ON")
+
+@app.route("/api/killswitch/status", methods=["GET"])
+def api_killswitch_status():
+    return jsonify({"enabled": _killswitch_get()}), 200
+
+@app.route("/api/killswitch/set", methods=["POST"])
+def api_killswitch_set():
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    state = _killswitch_set(enabled)
+    return jsonify({"enabled": state}), 200

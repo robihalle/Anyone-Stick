@@ -6,8 +6,6 @@
 # ============================================================================
 set -e
 
-ANON_VERSION="v0.4.9.11"
-ANON_URL="https://github.com/anyone-protocol/ator-protocol/releases/download/${ANON_VERSION}"
 PORTAL_DIR="/home/pi/portal"
 SCRIPT_DIR="/usr/local/bin"
 
@@ -36,6 +34,18 @@ log "System aktualisieren..."
 apt-get update -qq
 apt-get upgrade -y -qq
 
+# --- Non-interactive install (no prompts) ---
+export DEBIAN_FRONTEND=noninteractive
+
+# iptables-persistent: don't save current rules (we manage rules via mode scripts)
+echo iptables-persistent iptables-persistent/autosave_v4 boolean false | debconf-set-selections
+echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections
+
+# macchanger: don't enable automatic MAC changing globally
+echo macchanger macchanger/automatically_run boolean false | debconf-set-selections
+
+apt-get update -y -qq
+
 log "Pakete installieren..."
 apt-get install -y -qq \
     python3-flask \
@@ -46,7 +56,10 @@ apt-get install -y -qq \
     curl \
     unzip \
     jq \
-    libcap2
+    libcap2 \
+    macchanger
+
+
 
 # Python-Pakete für SSE/Threading-Support
 pip3 install --break-system-packages gunicorn 2>/dev/null || pip3 install gunicorn 2>/dev/null || true
@@ -59,54 +72,29 @@ systemctl disable --now triggerhappy 2>/dev/null || true
 systemctl disable --now apt-daily.timer 2>/dev/null || true
 systemctl disable --now apt-daily-upgrade.timer 2>/dev/null || true
 
-# 3. Anon-Binary herunterladen und installieren ─────────────────────────────
-log "Anon-Binary ${ANON_VERSION} herunterladen..."
+# 3. Anon via offizielles Anyone APT Repo installieren ─────────────────────
+log "Anon über offizielles APT-Repo installieren (bookworm kompatibel)..."
 
-ANON_INSTALLED=false
-for SUFFIX in "anon-linux-aarch64-${ANON_VERSION}.tar.gz" "anon_linux_aarch64.tar.gz" "anon-linux-arm64-${ANON_VERSION}.tar.gz"; do
-    if curl -fsSL -o /tmp/anon.tar.gz "${ANON_URL}/${SUFFIX}" 2>/dev/null; then
-        log "Download erfolgreich: ${SUFFIX}"
-        ANON_INSTALLED=true
-        break
-    fi
-done
+# GPG-Key hinzufügen
+wget -qO- https://deb.en.anyone.tech/anon.asc | tee /etc/apt/trusted.gpg.d/anon.asc >/dev/null
 
-# Fallback: .deb-Paket
-if [ "$ANON_INSTALLED" = false ]; then
-    for SUFFIX in "anon_aarch64.deb" "anon-${ANON_VERSION}_arm64.deb"; do
-        if curl -fsSL -o /tmp/anon.deb "${ANON_URL}/${SUFFIX}" 2>/dev/null; then
-            log "DEB-Paket gefunden: ${SUFFIX}"
-            dpkg -i /tmp/anon.deb || apt-get install -f -y
-            rm -f /tmp/anon.deb
-            ANON_INSTALLED=true
-            break
-        fi
-    done
+# Repo fest auf bookworm (funktioniert auch auf trixie)
+echo "deb [signed-by=/etc/apt/trusted.gpg.d/anon.asc] https://deb.en.anyone.tech anon-live-bookworm main" \
+  | tee /etc/apt/sources.list.d/anon.list >/dev/null
+
+apt-get update -qq
+apt-get install -y anon
+
+# Kompatibilitäts-Symlink (dein Start-Script erwartet /usr/local/bin/anon)
+ln -sf /usr/bin/anon /usr/local/bin/anon
+
+# Prüfen ob anon jetzt vorhanden ist
+if [ ! -x /usr/local/bin/anon ]; then
+    err "Anon konnte nicht installiert werden."
 fi
 
-# tar.gz entpacken
-if [ -f /tmp/anon.tar.gz ]; then
-    cd /tmp
-    tar xzf anon.tar.gz
-    ANON_BIN=$(find /tmp -name "anon" -type f -executable 2>/dev/null | head -1)
-    if [ -z "$ANON_BIN" ]; then
-        ANON_BIN=$(find /tmp -name "anon" -type f 2>/dev/null | head -1)
-    fi
-    if [ -n "$ANON_BIN" ]; then
-        cp "$ANON_BIN" /usr/local/bin/anon
-        chmod +x /usr/local/bin/anon
-        log "Anon installiert nach /usr/local/bin/anon"
-    else
-        warn "Anon-Binary nicht im Archiv gefunden — bitte manuell installieren!"
-    fi
-    rm -f /tmp/anon.tar.gz
-fi
+log "Anon erfolgreich installiert → /usr/local/bin/anon"
 
-if [ "$ANON_INSTALLED" = false ]; then
-    warn "Anon konnte nicht automatisch heruntergeladen werden."
-    warn "Bitte manuell von https://github.com/anyone-protocol/ator-protocol/releases installieren."
-    warn "Binary muss nach /usr/local/bin/anon kopiert werden."
-fi
 
 # 4. User 'pi' sicherstellen ────────────────────────────────────────────────
 if ! id pi &>/dev/null; then
@@ -115,34 +103,38 @@ if ! id pi &>/dev/null; then
 fi
 
 # 5. Anon DataDirectory erstellen ───────────────────────────────────────────
-mkdir -p /root/.anon
-log "Anon DataDirectory erstellt"
+# 5. Anon DataDirectory erstellen ───────────────────────────────────────────
+mkdir -p /var/lib/anon
+mkdir -p /var/log/anon
+chown -R root:root /var/lib/anon
+chmod 750 /var/lib/anon
+log "Anon DataDirectory erstellt → /var/lib/anon"
 
 # 6. anonrc schreiben ──────────────────────────────────────────────────────
 cat > /etc/anonrc << 'EOF'
-SocksPort 9050
+SocksPort 9050 IsolateDestAddr IsolateDestPort
 ControlPort 9051
 CookieAuthentication 1
-CookieAuthFile /root/.anon/control_auth_cookie
+CookieAuthFile /var/lib/anon/control_auth_cookie
+CookieAuthFileGroupReadable 1
 DNSPort 0.0.0.0:9053
 TransPort 0.0.0.0:9040
 User root
-DataDirectory /root/.anon
+DataDirectory /var/lib/anon
 AgreeToTerms 1
 AutomapHostsOnResolve 1
 VirtualAddrNetworkIPv4 10.192.0.0/10
 Log notice file /var/log/anon/notices.log
 
 # Performance tuning for Pi Zero 2W
-MaxMemInQueues 50 MB
-NumCPUs 1
+MaxMemInQueues 128 MB
+NumCPUs 4
 CircuitBuildTimeout 30
 LearnCircuitBuildTimeout 1
 CircuitStreamTimeout 20
 MaxClientCircuitsPending 16
 EOF
-mkdir -p /var/log/anon
-log "anonrc written → /etc/anonrc"
+log "anonrc geschrieben → /etc/anonrc"
 
 # 7. Boot-Config (config.txt) ──────────────────────────────────────────────
 BOOT_DIR="/boot/firmware"
@@ -163,11 +155,12 @@ gpu_mem=16
 otg_mode=1
 
 [cm5]
-dtoverlay=dwc2,dr_mode=host
+dtoverlay=dwc2,dr_mode=peripheral
 
 [all]
 enable_uart=1
-dtoverlay=dwc2
+dtoverlay=dwc2,dr_mode=peripheral
+
 EOF
 log "config.txt geschrieben → ${BOOT_DIR}/config.txt"
 
@@ -217,7 +210,13 @@ echo 0x80 > configs/c.1/bmAttributes
 echo 250 > configs/c.1/MaxPower
 
 mkdir -p functions/ncm.usb0
+
+# Stable MACs (recommended for Windows/macOS stability)
+echo "02:11:22:33:44:55" > functions/ncm.usb0/dev_addr
+echo "02:11:22:33:44:56" > functions/ncm.usb0/host_addr
+
 ln -s functions/ncm.usb0 configs/c.1/
+
 
 ls /sys/class/udc | head -n 1 > UDC
 SCRIPT
@@ -227,96 +226,105 @@ log "usb_gadget_setup.sh installiert"
 # 11. Mode-Scripts ─────────────────────────────────────────────────────────
 cat > ${SCRIPT_DIR}/mode_privacy.sh << 'SCRIPT'
 #!/bin/bash
-# Anyone Privacy Stick — Privacy Mode (Kill Switch enabled)
+# Anyone Privacy Stick – Privacy Mode (NO-LEAK + Portal always reachable)
+set -euo pipefail
 
-# 1. Firewall Reset
+IN_IF="usb0"
+PI_IP="192.168.7.1"
+TRANS_PORT="9040"
+DNS_PORT="9053"
+
+# Reset
 iptables -F
 iptables -t nat -F
 iptables -t mangle -F
 
-# 2. Forwarding & IPv6 Kill
-sysctl -w net.ipv4.ip_forward=1
-sysctl -w net.ipv6.conf.all.disable_ipv6=1
-sysctl -w net.ipv6.conf.default.disable_ipv6=1
-sysctl -w net.ipv6.conf.lo.disable_ipv6=1
-
-# 3. DEFAULT POLICY: DROP everything (Kill Switch)
+# Privacy = no-leak forwarding
 iptables -P FORWARD DROP
+iptables -P INPUT ACCEPT
+iptables -P OUTPUT ACCEPT
 
-# 4. LOKALE AUSNAHMEN (Portal muss IMMER gehen)
-iptables -t nat -A PREROUTING -i usb0 -p tcp --dport 80 -j RETURN
-iptables -t nat -A PREROUTING -i usb0 -d 192.168.7.1 -j RETURN
+# IPv6 off
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null
 
-# 5. DNS-FIX: Umleitung von 53 auf 9053 (Anyone DNS)
-iptables -t nat -A PREROUTING -i usb0 -p udp --dport 53 -j REDIRECT --to-ports 9053
-iptables -t nat -A PREROUTING -i usb0 -p tcp --dport 53 -j REDIRECT --to-ports 9053
+# Exempt ONLY traffic destined to the Pi itself (portal + local services)
+iptables -t nat -A PREROUTING -i "$IN_IF" -d "$PI_IP" -j RETURN
 
-# 6. TRANSPARENT PROXY: Alle anderen TCP-Anfragen in den Tunnel (9040)
-iptables -t nat -A PREROUTING -i usb0 -p tcp --syn -j REDIRECT --to-ports 9040
+# Force DNS to anon DNSPort
+iptables -t nat -A PREROUTING -i "$IN_IF" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+iptables -t nat -A PREROUTING -i "$IN_IF" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
 
-# 7. FORWARD: Nur established/related traffic erlauben (Kill Switch hardened)
-iptables -A FORWARD -i usb0 -o wlan0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -A FORWARD -i wlan0 -o usb0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+# Force ALL TCP to anon TransPort (no port-80 exemption!)
+iptables -t nat -A PREROUTING -i "$IN_IF" -p tcp -j REDIRECT --to-ports "$TRANS_PORT"
 
-# 8. ROUTING & MTU
-iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
+# Prevent UDP leaks (QUIC/WebRTC etc.) – DNS is redirected anyway
+iptables -A FORWARD -i "$IN_IF" -p udp -j DROP
+
+# Optional MSS clamp
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# 9. Block all non-tunnel UDP (except DNS redirect) — prevents UDP leaks
-iptables -A FORWARD -i usb0 -p udp --dport 53 -j ACCEPT
-iptables -A FORWARD -i usb0 -p udp -j DROP
-
-# 10. MAC Randomization (if enabled)
-if [ -f /var/lib/anyone-stick/mac_random_enabled ]; then
-    ip link set wlan0 down
-    macchanger -r wlan0 2>/dev/null || true
-    ip link set wlan0 up
-fi
-
-# 11. Kill Switch marker
+mkdir -p /var/lib/anyone-stick
 touch /var/lib/anyone-stick/killswitch_active
-
-# 12. LED & Status
-echo heartbeat | sudo tee /sys/class/leds/default-on/trigger
+echo heartbeat | tee /sys/class/leds/default-on/trigger >/dev/null 2>&1 || true
 SCRIPT
 chmod +x ${SCRIPT_DIR}/mode_privacy.sh
+log "mode_privacy.sh installiert"
 
+# Normal Mode Script
 cat > ${SCRIPT_DIR}/mode_normal.sh << 'SCRIPT'
 #!/bin/bash
-# Anyone Privacy Stick — Normal Mode (simple NAT, no tunnel)
+# Anyone Privacy Stick – Normal Mode
+# Internet directly via wlan0 (no tunnel)
 
+set -euo pipefail
+
+IN_IF="usb0"
+OUT_IF="wlan0"
+PI_IP="192.168.7.1"
+
+# Reset firewall
 iptables -F
 iptables -t nat -F
 iptables -t mangle -F
 
-# Default policy: ACCEPT (no kill switch)
+# Default policies
+iptables -P INPUT ACCEPT
+iptables -P OUTPUT ACCEPT
 iptables -P FORWARD ACCEPT
 
-# Einfaches NAT ohne Tunnel
-iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
-iptables -A FORWARD -i usb0 -o wlan0 -j ACCEPT
-iptables -A FORWARD -i wlan0 -o usb0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+# Enable forwarding
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# Re-enable IPv6 (if kernel allows it)
+sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null || true
+
+# NAT for internet access
+iptables -t nat -A POSTROUTING -o "$OUT_IF" -j MASQUERADE
+
+# Allow forwarding
+iptables -A FORWARD -i "$IN_IF" -o "$OUT_IF" -j ACCEPT
+iptables -A FORWARD -i "$OUT_IF" -o "$IN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# TCP MSS clamp
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# Re-enable IPv6
-sysctl -w net.ipv6.conf.all.disable_ipv6=0
-sysctl -w net.ipv6.conf.default.disable_ipv6=0
-
-# Exit-Country-Auswahl zurücksetzen
-sed -i '/^ExitNodes/d' /etc/anonrc
-sed -i '/^StrictNodes/d' /etc/anonrc
-
-# Anon-Config neu laden (falls Prozess läuft)
-pkill -SIGHUP -x anon 2>/dev/null || true
-
 # Remove Kill Switch marker
-rm -f /var/lib/anyone-stick/killswitch_active
+rm -f /var/lib/anyone-stick/killswitch_active || true
 
-# LED: dauerhaft an = Normal Mode
-echo default-on | sudo tee /sys/class/leds/default-on/trigger
+# LED solid (best effort)
+echo default-on | tee /sys/class/leds/default-on/trigger >/dev/null 2>&1 || true
+
+echo "OK: Normal Mode enabled (direct internet)."
 SCRIPT
+
 chmod +x ${SCRIPT_DIR}/mode_normal.sh
-log "mode_privacy.sh & mode_normal.sh installiert"
+log "mode_normal.sh installiert"
+
 
 # 12. Start-Script ─────────────────────────────────────────────────────────
 cat > ${SCRIPT_DIR}/start_anyone_stack.sh << 'SCRIPT'
@@ -387,6 +395,7 @@ dhcp-option=3,192.168.7.1
 dhcp-option=6,192.168.7.1
 dhcp-authoritative
 leasefile-ro
+address=/anyone.stick/192.168.7.1
 EOF
 log "dnsmasq configured for usb0 (192.168.7.0/24)"
 
@@ -486,7 +495,8 @@ class AnonController:
     def __init__(self, host="127.0.0.1", port=9051):
         self.host = host
         self.port = port
-        self.cookie_path = "/root/.anon/control_auth_cookie"
+        self.cookie_path = "/var/lib/anon/control_auth_cookie"
+
 
         # Connection state
         self._sock = None
@@ -1550,7 +1560,6 @@ EOF
 systemctl daemon-reload
 systemctl enable usb-gadget.service
 systemctl enable anyone-stick.service
-systemctl disable dnsmasq  # started manually by start_anyone_stack.sh
 log "Systemd Services aktiviert"
 
 # 18. Kernel-Module laden ──────────────────────────────────────────────────
@@ -1561,7 +1570,7 @@ log "Kernel-Module registriert (dwc2, libcomposite)"
 
 # 19. sudoers für pi (damit Flask iptables aufrufen kann) ──────────────────
 cat > /etc/sudoers.d/anyone-stick << 'EOF'
-pi ALL=(ALL) NOPASSWD: /usr/local/bin/mode_privacy.sh, /usr/local/bin/mode_normal.sh, /usr/sbin/iptables, /usr/bin/tee /sys/class/leds/*, /usr/bin/pgrep
+pi ALL=(ALL) NOPASSWD: /usr/local/bin/mode_privacy.sh, /usr/local/bin/mode_normal.sh, /usr/sbin/iptables, /usr/bin/tee, /usr/bin/pgrep
 EOF
 chmod 440 /etc/sudoers.d/anyone-stick
 log "sudoers konfiguriert"

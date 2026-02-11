@@ -1,37 +1,9 @@
-# Anyone Privacy Stick – config.txt (optimiert für headless USB-Betrieb)
-
-# Unnötige Hardware-Interfaces deaktiviert
-#dtparam=i2c_arm=on
-#dtparam=i2s=on
-#dtparam=spi=on
-
-# Audio aus (headless)
+# Anyone Privacy Stick config.txt (optimiert für headless USB-Betrieb)
 dtparam=audio=off
-
-# Kamera & Display nicht nötig
-#camera_auto_detect=1
-#display_auto_detect=1
-
-# Kein GPU-Treiber nötig (headless)
-#dtoverlay=vc4-kms-v3d
-#max_framebuffers=2
-
-# Kein initramfs nötig
-#auto_initramfs=1
-
-# Kein Kernel-Video-Setup
 disable_fw_kms_setup=1
-
-# 64-bit
 arm_64bit=1
-
-# Kein Overscan
 disable_overscan=1
-
-# Maximale CPU-Geschwindigkeit
 arm_boost=1
-
-# Boot beschleunigen
 disable_splash=1
 boot_delay=0
 gpu_mem=16
@@ -40,8 +12,9 @@ gpu_mem=16
 otg_mode=1
 
 [cm5]
-dtoverlay=dwc2,dr_mode=host
+dtoverlay=dwc2,dr_mode=peripheral
 
 [all]
 enable_uart=1
-dtoverlay=dwc2
+dtoverlay=dwc2,dr_mode=peripheral
+
