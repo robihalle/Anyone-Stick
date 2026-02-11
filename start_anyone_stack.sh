@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Anyone Privacy Stick – Master Startup Script
+# Anyone Privacy Stick Master Startup Script
 # Started by anyone-stick.service AFTER usb-gadget.service
 # ============================================================================
 
@@ -13,7 +13,7 @@ for i in $(seq 1 10); do
 done
 
 if ! ip link show usb0 &>/dev/null; then
-    echo "ERROR: usb0 not found after 5s – USB gadget broken?"
+    echo "ERROR: usb0 not found after 5s — USB gadget broken?"
     exit 1
 fi
 
@@ -26,8 +26,22 @@ sleep 0.5
 # 3. Start dnsmasq (DHCP for host PC)
 systemctl restart dnsmasq
 
-# 4. Start portal (reachable at 192.168.7.1 right away)
-python3 /home/pi/portal/app.py &
+# 4. Start portal (Flask with threaded=True for SSE support)
+#    The app.py calls anon_ctrl.start() at module level, so the
+#    AnonController reconnect loop starts automatically.
+#    We use --timeout 0 to prevent gunicorn from killing SSE workers.
+#    Fallback: plain python3 with threaded=True (built into app.py).
+if command -v gunicorn &>/dev/null; then
+    gunicorn --bind 0.0.0.0:80 \
+             --workers 1 \
+             --threads 4 \
+             --timeout 0 \
+             --worker-class gthread \
+             --chdir /home/pi/portal \
+             app:app &
+else
+    python3 /home/pi/portal/app.py &
+fi
 
 # 5. Connect Wi-Fi in background (non-blocking)
 nmcli con up "Stick-Gateway" 2>/dev/null &
@@ -38,5 +52,5 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# 7. Start anon (blocks – keeps service alive)
+# 7. Start anon (blocks — keeps service alive)
 /usr/local/bin/anon -f /etc/anonrc
