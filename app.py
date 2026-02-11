@@ -5,7 +5,7 @@
 # ============================================================================
 
 from flask import Flask, request, jsonify, render_template_string, redirect, Response
-import subprocess, time, os, signal, re, socket, threading, queue, json, logging
+import subprocess, time, os, signal, re, socket, threading, queue, json, logging, random
 
 from pathlib import Path
 app = Flask(__name__, static_folder="static")
@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.INFO,
 # ──────────────────────────────────────────────
 stats = {"rx": 0, "tx": 0, "time": 0, "speed_rx": 0, "speed_tx": 0}
 ANONRC_PATH = "/etc/anonrc"
+rotation_mgr = None
 
 EXIT_COUNTRIES = [
     ("auto", "\U0001f30d Automatic (Best Available)"),
@@ -201,6 +202,11 @@ class AnonController:
         try:
             q.put_nowait(self.get_status())
             q.put_nowait({"type":"circuit","status":"SNAPSHOT","hops":self.get_circuit_detail()})
+            try:
+                if rotation_mgr:
+                    q.put_nowait(rotation_mgr.get_state())
+            except Exception:
+                pass
         except Exception:
             pass
         return q
@@ -224,15 +230,24 @@ class AnonController:
     def _read_reply_lines(self, f) -> str:
         out = []
         while True:
-            line = f.readline()
+            try:
+                line = f.readline()
+            except TimeoutError:
+                # ControlPort can be quiet; a socket timeout is not a disconnect.
+                continue
+
             if not line:
                 break
-            s = line.decode("utf-8", errors="replace").rstrip("\r\n")
-            out.append(s)
-            if s.startswith("250-"):
+
+            sline = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            out.append(sline)
+
+            # 250-... multi-line replies end with a final "250 ..."
+            if sline.startswith("250-"):
                 continue
-            if s.startswith(("250 ", "250 OK", "250 closing", "4", "5", "515 ")):
+            if sline.startswith(("250 ", "250 OK", "250 closing", "4", "5", "515 ")):
                 break
+
         return "\n".join(out)
 
     def _one_shot(self, cmds, timeout=3) -> str:
@@ -290,7 +305,11 @@ class AnonController:
                 self._push({"type":"circuit","status":"SNAPSHOT","hops":self.get_circuit_detail()})
 
                 while not self._stop.is_set():
-                    line = f.readline()
+                    try:
+                        line = f.readline()
+                    except TimeoutError:
+                        # No events right now (socket timeout). Keep the reader loop alive.
+                        continue
                     if not line:
                         raise RuntimeError("EOF from ControlPort")
                     sline = line.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -353,7 +372,14 @@ class AnonController:
                 log.info("Circuit BUILT (%d hops)", len(hops))
                 self._push({"type":"circuit","status":"BUILT","hops":hops})
                 self._push(self.get_status())
+
+                try:
+                    if rotation_mgr:
+                        rotation_mgr.note_circuit_built()
+                except Exception:
+                    pass
                 return
+
         except Exception:
             pass
 
@@ -467,6 +493,203 @@ def set_exit_country(country_code):
 # ============================================================================
 # HTML Template
 # ============================================================================
+
+
+# ──────────────────────────────────────────────
+# Circuit Rotation (timer-based NEWNYM)
+# ──────────────────────────────────────────────
+ROTATION_STATE_PATH = "/var/lib/anyone-stick/rotation.json"
+DEFAULT_ROTATE_SECONDS = 600
+DEFAULT_VARIANCE_PERCENT = 0
+MIN_ROTATE_SECONDS = 60
+MAX_ROTATE_SECONDS = 86400
+ROTATION_BUILD_TIMEOUT = 15
+
+def _load_rotation_state():
+    try:
+        with open(ROTATION_STATE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        enabled = bool(d.get("enabled", False))
+        interval = int(d.get("interval_seconds", DEFAULT_ROTATE_SECONDS))
+        interval = max(MIN_ROTATE_SECONDS, min(interval, MAX_ROTATE_SECONDS))
+        variance = int(d.get("variance_percent", DEFAULT_VARIANCE_PERCENT))
+        variance = max(0, min(variance, 50))
+        return {"enabled": enabled, "interval_seconds": interval, "variance_percent": variance}
+    except Exception:
+        return {"enabled": False, "interval_seconds": DEFAULT_ROTATE_SECONDS, "variance_percent": DEFAULT_VARIANCE_PERCENT}
+
+def _save_rotation_state(enabled: bool, interval_seconds: int, variance_percent: int):
+    os.makedirs(os.path.dirname(ROTATION_STATE_PATH), exist_ok=True)
+    tmp = ROTATION_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "enabled": bool(enabled),
+                "interval_seconds": int(interval_seconds),
+                "variance_percent": int(variance_percent),
+            },
+            f,
+        )
+    os.replace(tmp, ROTATION_STATE_PATH)
+
+class RotationManager(threading.Thread):
+    """
+    Timer-based circuit rotation:
+    - When enabled and privacy mode is active, triggers NEWNYM on schedule.
+    - Smooth: existing streams keep running; new streams use new circuits once built.
+    - Watchdog prevents UI from getting stuck in 'rotating'.
+    """
+
+    def __init__(self, ctrl):
+        super().__init__(daemon=True)
+        self.ctrl = ctrl
+        st = _load_rotation_state()
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
+
+        self.enabled = bool(st.get("enabled", False))
+        self.interval_seconds = int(st.get("interval_seconds", DEFAULT_ROTATE_SECONDS))
+        self.variance_percent = int(st.get("variance_percent", DEFAULT_VARIANCE_PERCENT))
+
+        self.next_rotate_at = 0
+        self.last_rotated_at = 0
+        self.phase = "disabled" if not self.enabled else "idle"
+        self.rotation_pending = False
+
+        self._schedule_next(time.time())
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def _privacy_active(self) -> bool:
+        # Prefer app's own mode flag if present; fallback to iptables.
+        try:
+            for k in ("CURRENT_MODE", "MODE", "mode"):
+                if k in globals():
+                    return str(globals().get(k, "")).lower() == "privacy"
+        except Exception:
+            pass
+        try:
+            cmd = "sudo iptables -t nat -S | grep -E '(REDIRECT|DNAT).*9040|--to-ports 9040' >/dev/null"
+            return subprocess.run(cmd, shell=True).returncode == 0
+        except Exception:
+            return False
+
+    def _effective_interval(self) -> int:
+        base = max(MIN_ROTATE_SECONDS, min(int(self.interval_seconds), MAX_ROTATE_SECONDS))
+        var = max(0, min(int(self.variance_percent), 50))
+        if var <= 0:
+            return base
+        delta = base * (var / 100.0)
+        jitter = random.uniform(-delta, +delta)
+        eff = int(base + jitter)
+        return max(MIN_ROTATE_SECONDS, min(eff, MAX_ROTATE_SECONDS))
+
+    def _schedule_next(self, now_ts: float):
+        with self._lock:
+            if not self.enabled:
+                self.next_rotate_at = 0
+                self.phase = "disabled"
+                return
+            eff = self._effective_interval()
+            self.next_rotate_at = int(now_ts + eff)
+            if self.phase == "disabled":
+                self.phase = "idle"
+
+    def get_state(self):
+        with self._lock:
+            now = int(time.time())
+            remaining = max(0, int(self.next_rotate_at - now)) if self.next_rotate_at else 0
+            return {
+                "type": "rotation",
+                "enabled": bool(self.enabled),
+                "interval_seconds": int(self.interval_seconds),
+                "variance_percent": int(self.variance_percent),
+                "next_rotate_at": int(self.next_rotate_at) if self.next_rotate_at else 0,
+                "last_rotated_at": int(self.last_rotated_at) if self.last_rotated_at else 0,
+                "remaining_seconds": int(remaining),
+                "phase": self.phase,
+                "pending": bool(self.rotation_pending),
+            }
+
+    def update(self, enabled: bool, interval_seconds: int, variance_percent: int = 0):
+        interval_seconds = max(MIN_ROTATE_SECONDS, min(int(interval_seconds), MAX_ROTATE_SECONDS))
+        variance_percent = max(0, min(int(variance_percent), 50))
+        with self._lock:
+            self.enabled = bool(enabled)
+            self.interval_seconds = interval_seconds
+            self.variance_percent = variance_percent
+            self.rotation_pending = False
+            self.phase = "disabled" if not self.enabled else "idle"
+            _save_rotation_state(self.enabled, self.interval_seconds, self.variance_percent)
+        self._schedule_next(time.time())
+        self.ctrl._push(self.get_state())
+
+    def trigger(self, reason: str = "timer"):
+        with self._lock:
+            if not self.enabled or self.rotation_pending:
+                return False
+            if not self._privacy_active():
+                self.phase = "waiting_for_privacy"
+                self.ctrl._push(self.get_state())
+                return False
+            self.rotation_pending = True
+            self.phase = "rotating"
+            self.last_rotated_at = int(time.time())
+
+        st = self.get_state()
+        st["reason"] = reason
+        self.ctrl._push(st)
+
+        try:
+            self.ctrl.new_circuit()
+        except Exception:
+            with self._lock:
+                self.phase = "error"
+                self.rotation_pending = False
+            self.ctrl._push(self.get_state())
+            return False
+
+        def _watchdog():
+            time.sleep(ROTATION_BUILD_TIMEOUT)
+            with self._lock:
+                if self.rotation_pending:
+                    self.rotation_pending = False
+                    self.phase = "idle" if self.enabled else "disabled"
+            self._schedule_next(time.time())
+            self.ctrl._push(self.get_state())
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+        return True
+
+    def note_circuit_built(self):
+        with self._lock:
+            if self.rotation_pending:
+                self.rotation_pending = False
+                self.phase = "swapped"
+        self._schedule_next(time.time())
+        self.ctrl._push(self.get_state())
+
+        def _idle_later():
+            time.sleep(2)
+            with self._lock:
+                if self.enabled and not self.rotation_pending and self.phase == "swapped":
+                    self.phase = "idle"
+            self.ctrl._push(self.get_state())
+
+        threading.Thread(target=_idle_later, daemon=True).start()
+
+    def run(self):
+        self.ctrl._push(self.get_state())
+        while not self._stop_evt.is_set():
+            time.sleep(0.5)
+            if not self.enabled:
+                continue
+            if not self.next_rotate_at:
+                self._schedule_next(time.time())
+                continue
+            if int(time.time()) >= int(self.next_rotate_at):
+                self.trigger("timer")
 
 HTML = """
 <!DOCTYPE html>
@@ -642,6 +865,7 @@ function connectSSE() {
       const d = JSON.parse(e.data);
       if (d.type === 'status') updateStatus(d);
       else if (d.type === 'circuit') updateCircuit(d);
+      else if (d.type === 'rotation') applyRotationState(d);
     } catch(err) {}
   };
 
@@ -799,7 +1023,155 @@ pollCircuit();
 setInterval(pollCircuit, 3000);
 pollTraffic();
 setInterval(pollTraffic, 1000);
+
+
+// ──────────────────────────────────────────────
+// Circuit rotation UI
+// ──────────────────────────────────────────────
+let rotationState = {
+  enabled: false,
+  interval_seconds: 600,
+  variance_percent: 0,
+  next_rotate_at: 0,
+  remaining_seconds: 0,
+  phase: "disabled",
+  pending: false
+};
+
+function fmtSeconds(sec) {
+  sec = Math.max(0, parseInt(sec || 0, 10));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function applyRotationState(st) {
+  if (!st) return;
+  rotationState = { ...rotationState, ...st };
+  const enabledEl = document.getElementById("rotation-enabled");
+  const minutesEl = document.getElementById("rotation-minutes");
+  const phaseEl = document.getElementById("rotation-phase");
+  const remainEl = document.getElementById("rotation-remaining");
+  const varEl = document.getElementById("rotation-variance");
+
+  if (enabledEl) enabledEl.checked = !!rotationState.enabled;
+  if (minutesEl) minutesEl.value = Math.max(1, Math.round((rotationState.interval_seconds || 600) / 60));
+  if (varEl) varEl.value = Math.max(0, Math.min(50, parseInt(rotationState.variance_percent || 0, 10) || 0));
+
+  if (phaseEl) phaseEl.textContent = rotationState.phase || "—";
+
+  // remaining based on next_rotate_at
+  if (remainEl) {
+    if (!rotationState.enabled || !rotationState.next_rotate_at) {
+      remainEl.textContent = "—";
+    } else {
+      const now = Math.floor(Date.now() / 1000);
+      const rem = Math.max(0, (rotationState.next_rotate_at || 0) - now);
+      remainEl.textContent = fmtSeconds(rem);
+    }
+  }
+}
+
+async function fetchRotation() {
+  try {
+    const r = await fetch("/api/rotation");
+    const st = await r.json();
+    applyRotationState(st);
+  } catch (e) {}
+}
+
+async function saveRotation() {
+  const enabled = document.getElementById("rotation-enabled")?.checked || false;
+  let minutes = parseInt(document.getElementById("rotation-minutes")?.value || "10", 10);
+  if (!Number.isFinite(minutes) || minutes < 1) minutes = 10;
+  if (minutes > 1440) minutes = 1440;
+  const interval_seconds = minutes * 60;
+
+  let variance_percent = parseInt(document.getElementById("rotation-variance")?.value || "0", 10);
+  if (!Number.isFinite(variance_percent) || variance_percent < 0) variance_percent = 0;
+  if (variance_percent > 50) variance_percent = 50;
+
+  try {
+    const r = await fetch("/api/rotation", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ enabled, interval_seconds, variance_percent })
+    });
+    const st = await r.json();
+    applyRotationState(st);
+  } catch (e) {}
+}
+
+async function triggerRotationNow() {
+  try {
+    const r = await fetch("/api/rotation/trigger", { method: "POST" });
+    const st = await r.json();
+    applyRotationState(st);
+  } catch (e) {}
+}
+
+function bindRotationUI() {
+  document.getElementById("rotation-save")?.addEventListener("click", saveRotation);
+  document.getElementById("rotation-trigger")?.addEventListener("click", triggerRotationNow);
+}
+
+setInterval(() => {
+  // client-side countdown tick
+  if (!rotationState.enabled || !rotationState.next_rotate_at) return;
+  const now = Math.floor(Date.now() / 1000);
+  const rem = Math.max(0, rotationState.next_rotate_at - now);
+  const remainEl = document.getElementById("rotation-remaining");
+  if (remainEl) remainEl.textContent = fmtSeconds(rem);
+}, 1000);
+
+// Hook SSE: your existing SSE handler should call onMessage.
+// We patch in a tiny adapter if not present:
+try {
+  // When your SSE handler receives message data (already JSON parsed),
+  // it typically checks msg.type. We add handling for type === "rotation".
+} catch (e) {}
+
+document.addEventListener("DOMContentLoaded", () => {
+  bindRotationUI();
+  fetchRotation();
+});
+
 </script>
+
+  <!-- ────────────────────────────────────────────── -->
+  <!-- Circuit rotation -->
+  <!-- ────────────────────────────────────────────── -->
+  <div class="card" style="margin-top:14px;">
+    <h3 style="margin:0 0 10px 0;">Circuit Rotation</h3>
+
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+      <label style="display:flex; align-items:center; gap:8px;">
+        <input id="rotation-enabled" type="checkbox" />
+        <span>Auto-rotate circuit</span>
+      </label>
+
+      <label style="display:flex; align-items:center; gap:8px;">
+        <span>Interval (minutes)</span>
+        <input id="rotation-minutes" type="number" min="1" max="1440" step="1" value="10"
+               style="width:100px; padding:6px 8px; border-radius:10px; border:1px solid rgba(255,255,255,0.15);" />
+      </label>
+
+      <label style="display:flex; align-items:center; gap:8px;">
+        <span>Variance (%)</span>
+        <input id="rotation-variance" type="number" min="0" max="50" step="1" value="0"
+               style="width:90px; padding:6px 8px; border-radius:10px; border:1px solid rgba(255,255,255,0.15);" />
+      </label>
+
+      <button id="rotation-save" class="btn" type="button">Save</button>
+      <button id="rotation-trigger" class="btn" type="button" title="Trigger now">Rotate now</button>
+    </div>
+
+    <div style="margin-top:10px; display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+      <div>State: <b id="rotation-phase">—</b></div>
+      <div>Next rotation in: <b id="rotation-remaining">—</b></div>
+      <div style="opacity:0.8;">(Existing connections stay alive; new ones use the new circuit)</div>
+    </div>
+  </div>
 </body></html>
 """
 
@@ -870,6 +1242,81 @@ def api_new_circuit():
     resp = anon_ctrl.new_circuit()
     ok = resp is not None and "250" in resp
     return jsonify({"status": "ok" if ok else "failed"})
+
+
+# ──── Circuit rotation (timer) ────
+
+@app.route("/api/rotation", methods=["GET"])
+def api_rotation_get():
+    if not rotation_mgr:
+        return jsonify({
+            "type": "rotation",
+            "enabled": False,
+            "interval_seconds": DEFAULT_ROTATE_SECONDS,
+            "variance_percent": DEFAULT_VARIANCE_PERCENT,
+            "next_rotate_at": 0,
+            "last_rotated_at": 0,
+            "remaining_seconds": 0,
+            "phase": "disabled",
+            "pending": False,
+        }), 200
+    return jsonify(rotation_mgr.get_state()), 200
+
+
+@app.route("/api/rotation", methods=["POST"])
+def api_rotation_set():
+    if not rotation_mgr:
+        return jsonify({"ok": False, "error": "rotation manager not ready"}), 500
+    d = request.get_json(silent=True) or {}
+    enabled = bool(d.get("enabled", False))
+    interval = d.get("interval_seconds", d.get("interval", DEFAULT_ROTATE_SECONDS))
+    variance = d.get("variance_percent", DEFAULT_VARIANCE_PERCENT)
+    try:
+        interval = int(interval)
+    except Exception:
+        interval = DEFAULT_ROTATE_SECONDS
+    try:
+        variance = int(variance)
+    except Exception:
+        variance = DEFAULT_VARIANCE_PERCENT
+
+    interval = max(MIN_ROTATE_SECONDS, min(interval, MAX_ROTATE_SECONDS))
+    variance = max(0, min(variance, 50))
+
+    rotation_mgr.update(enabled, interval, variance)
+    return jsonify({"ok": True, **rotation_mgr.get_state()}), 200
+
+
+@app.route("/api/rotation/trigger", methods=["POST"])
+def api_rotation_trigger():
+    if not rotation_mgr:
+        return jsonify({"ok": False, "error": "rotation manager not ready"}), 500
+    ok = rotation_mgr.trigger("manual")
+    return jsonify({"ok": bool(ok), **rotation_mgr.get_state()}), 200
+
+
+# ──── Debug helpers ────
+@app.route("/api/debug/routes", methods=["GET"])
+def api_debug_routes():
+    try:
+        import app as app_module
+        mod_file = getattr(app_module, "__file__", "unknown")
+    except Exception as e:
+        mod_file = f"import_error:{e}"
+
+    rules = []
+    try:
+        for r in sorted(app.url_map.iter_rules(), key=lambda x: x.rule):
+            rules.append({"rule": r.rule, "methods": sorted([m for m in r.methods if m not in ("HEAD","OPTIONS")])})
+    except Exception as e:
+        rules.append({"error": str(e)})
+
+    return jsonify({
+        "module_file": mod_file,
+        "gunicorn_target": "app:app",
+        "rules_count": len(rules),
+        "rules": rules,
+    }), 200
 
 
 @app.route("/api/circuit", methods=["GET"])
@@ -950,6 +1397,9 @@ def mode_normal():
 
 anon_ctrl = AnonController()
 anon_ctrl.start()
+
+rotation_mgr = RotationManager(anon_ctrl)
+rotation_mgr.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=80, threaded=True)
