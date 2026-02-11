@@ -45,549 +45,46 @@ EXIT_COUNTRIES = [
 # AnonController v2 — Persistent connection with event support
 # ============================================================================
 
-class AnonController:
-    """Persistent connection to the anon daemon ControlPort with event support.
-
-    Architecture:
-    - Single persistent TCP connection (re-established on failure)
-    - Background listener thread separates replies (250) from events (650)
-    - SETEVENTS CIRC STATUS_CLIENT for push-based monitoring
-    - Thread-safe reply queue for command/response correlation
-    - SSE broadcast to all connected frontend clients
-    """
-
-    COUNTRY_NAMES = {
-        "AD": "Andorra", "AE": "UAE", "AT": "Austria", "AU": "Australia",
-        "BE": "Belgium", "BG": "Bulgaria", "BR": "Brazil", "CA": "Canada",
-        "CH": "Switzerland", "CL": "Chile", "CN": "China", "CO": "Colombia",
-        "CZ": "Czech Republic", "DE": "Germany", "DK": "Denmark",
-        "EE": "Estonia", "ES": "Spain", "FI": "Finland", "FR": "France",
-        "GB": "United Kingdom", "GR": "Greece", "HK": "Hong Kong",
-        "HR": "Croatia", "HU": "Hungary", "ID": "Indonesia", "IE": "Ireland",
-        "IL": "Israel", "IN": "India", "IS": "Iceland", "IT": "Italy",
-        "JP": "Japan", "KR": "South Korea", "LT": "Lithuania",
-        "LU": "Luxembourg", "LV": "Latvia", "MD": "Moldova", "MX": "Mexico",
-        "MY": "Malaysia", "NL": "Netherlands", "NO": "Norway",
-        "NZ": "New Zealand", "PA": "Panama", "PL": "Poland",
-        "PT": "Portugal", "RO": "Romania", "RS": "Serbia", "RU": "Russia",
-        "SE": "Sweden", "SG": "Singapore", "SI": "Slovenia",
-        "SK": "Slovakia", "TH": "Thailand", "TR": "Turkey", "TW": "Taiwan",
-        "UA": "Ukraine", "US": "United States", "ZA": "South Africa",
-    }
-
-    def __init__(self, host="127.0.0.1", port=9051):
-        self.host = host
-        self.port = port
-        self.cookie_path = "/root/.anon/control_auth_cookie"
-
-        # Connection state
-        self._sock = None
-        self._rfile = None                     # buffered reader for the socket
-        self._lock = threading.Lock()          # protects _sock writes
-        self._reply_queue = queue.Queue()      # 250/251/… replies
-        self._connected = False
-        self._authenticated = False
-
-        # SSE client management
-        self._sse_clients = []                 # list[queue.Queue] per SSE client
-        self._sse_lock = threading.Lock()
-
-        # Cached state from events (always up-to-date)
-        self._bootstrap = {"progress": 0, "summary": "", "tag": ""}
-        self._circuit_hops = []                # latest BUILT circuit hops
-        self._last_circ_id = None
-        self._state_lock = threading.RLock()   # protects cached state
-
-        # Relay IP/country cache  {fingerprint: {ip, cc, name, ts}}
-        self._relay_cache = {}
-        self._relay_cache_ttl = 3600           # 1 h
-
-        # Background threads
-        self._reader_thread = None
-        self._reconnect_thread = None
-        self._stop_event = threading.Event()
-
-    # ────────────────── Lifecycle ──────────────────
-
-    def start(self):
-        """Start the persistent connection (call once at app startup)."""
-        self._stop_event.clear()
-        self._reconnect_thread = threading.Thread(
-            target=self._reconnect_loop, daemon=True, name="anon-reconnect"
-        )
-        self._reconnect_thread.start()
-        log.info("AnonController started (reconnect loop running)")
-
-    def stop(self):
-        """Shut down the persistent connection."""
-        self._stop_event.set()
-        self._disconnect()
-
-    # ────────────────── Connection management ──────────────────
-
-    def _reconnect_loop(self):
-        """Keep trying to (re)connect to the ControlPort."""
-        while not self._stop_event.is_set():
-            if not self._connected:
-                try:
-                    self._connect()
-                except Exception as e:
-                    log.debug("ControlPort connect failed: %s", e)
-            self._stop_event.wait(timeout=3)
-
-    def _connect(self):
-        """Establish TCP connection, authenticate, subscribe to events."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect((self.host, self.port))
-        sock.settimeout(None)
-        self._sock = sock
-        self._rfile = sock.makefile("r", encoding="utf-8", errors="replace")
-        self._connected = True
-        log.info("TCP connected to %s:%s", self.host, self.port)
-
-        # Start reader thread BEFORE sending commands
-        self._reader_thread = threading.Thread(
-            target=self._reader_loop, daemon=True, name="anon-reader"
-        )
-        self._reader_thread.start()
-
-        # Authenticate
-        self._authenticate()
-
-        # Subscribe to push events
-        self._subscribe_events()
-
-    def _disconnect(self):
-        """Tear down the TCP connection."""
-        self._connected = False
-        self._authenticated = False
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-            self._sock = None
-        if self._rfile:
-            try:
-                self._rfile.close()
-            except Exception:
-                pass
-            self._rfile = None
-        # Drain reply queue
-        while not self._reply_queue.empty():
-            try:
-                self._reply_queue.get_nowait()
-            except queue.Empty:
-                break
-
-    def _authenticate(self):
-        """Authenticate via COOKIE or password."""
-        cookie_hex = None
-        if os.path.exists(self.cookie_path):
-            try:
-                with open(self.cookie_path, "rb") as f:
-                    cookie_hex = f.read().hex()
-            except Exception:
-                pass
-
-        if cookie_hex:
-            resp = self.command(f"AUTHENTICATE {cookie_hex}")
-        else:
-            resp = self.command('AUTHENTICATE ""')
-
-        if resp and "250" in resp:
-            self._authenticated = True
-            log.info("Authenticated to ControlPort")
-        else:
-            log.warning("Authentication failed: %s", resp)
-            raise ConnectionError(f"Auth failed: {resp}")
-
-    def _subscribe_events(self):
-        """Subscribe to CIRC + STATUS_CLIENT events for push updates."""
-        resp = self.command("SETEVENTS CIRC STATUS_CLIENT")
-        if resp and "250" in resp:
-            log.info("Subscribed to CIRC + STATUS_CLIENT events")
-        else:
-            log.warning("SETEVENTS failed: %s", resp)
-
-    # ────────────────── Reader thread ──────────────────
-
-    def _reader_loop(self):
-        """Background thread: read lines from ControlPort, route to queues."""
-        buf = []
-        try:
-            while self._connected and not self._stop_event.is_set():
-                try:
-                    line = self._rfile.readline()
-                except Exception:
-                    break
-                if not line:
-                    break  # EOF — connection lost
-
-                line = line.rstrip("\r\n")
-
-                # Async event lines start with "650"
-                if line.startswith("650"):
-                    # 650-continuation or 650 final
-                    if line.startswith("650-"):
-                        buf.append(line[4:])
-                    else:
-                        # "650 <payload>" — single-line or final line of multi
-                        payload = line[4:] if line.startswith("650 ") else line
-                        buf.append(payload)
-                        full_event = " ".join(buf)
-                        buf = []
-                        self._handle_event(full_event)
-                else:
-                    # Regular reply (250, 251, 515, …)
-                    self._reply_queue.put(line)
-
-        except Exception as e:
-            log.debug("Reader loop exception: %s", e)
-        finally:
-            log.info("Reader loop exited — marking disconnected")
-            self._disconnect()
-
-    # ────────────────── Command interface ──────────────────
-
-    def command(self, cmd, timeout=10):
-        """Send a command and wait for the reply (thread-safe)."""
-        return self._command_raw(cmd, timeout)
-
-    def _command_raw(self, cmd, timeout=10):
-        """Low-level: send command, collect all reply lines until final 250/5xx."""
-        if not self._connected or not self._sock:
-            return None
-        # Drain stale replies
-        while not self._reply_queue.empty():
-            try:
-                self._reply_queue.get_nowait()
-            except queue.Empty:
-                break
-        with self._lock:
-            try:
-                self._sock.sendall((cmd + "\r\n").encode("utf-8"))
-            except Exception:
-                self._disconnect()
-                return None
-
-        # Collect multi-line reply
-        lines = []
-        deadline = time.time() + timeout
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            try:
-                line = self._reply_queue.get(timeout=min(remaining, 1))
-                lines.append(line)
-                # A line like "250 OK" or "250 …" (without '-') is the final line
-                if re.match(r"^\d{3} ", line):
-                    break
-                # "250-..." means more lines follow
-            except queue.Empty:
-                continue
-        return "\r\n".join(lines) if lines else None
-
-    # ────────────────── Event handling ──────────────────
-
-    def _handle_event(self, event_line):
-        """Process a 650 event from the anon daemon."""
-        parts = event_line.split(" ", 1)
-        if len(parts) < 2:
-            return
-        event_type = parts[0]
-        payload = parts[1]
-
-        if event_type == "STATUS_CLIENT":
-            self._handle_status_event(payload)
-        elif event_type == "CIRC":
-            self._handle_circ_event(payload)
-
-    def _handle_status_event(self, payload):
-        """Handle STATUS_CLIENT events (bootstrap progress)."""
-        m_prog = re.search(r"PROGRESS=(\d+)", payload)
-        m_summ = re.search(r'SUMMARY="([^"]*)"', payload)
-        m_tag = re.search(r"TAG=(\S+)", payload)
-
-        with self._state_lock:
-            if m_prog:
-                self._bootstrap["progress"] = int(m_prog.group(1))
-            if m_summ:
-                self._bootstrap["summary"] = m_summ.group(1)
-            if m_tag:
-                self._bootstrap["tag"] = m_tag.group(1)
-
-        self._broadcast_sse(self._build_status_dict())
-
-    def _handle_circ_event(self, payload):
-        """Handle CIRC events (circuit build / close)."""
-        parts = payload.split()
-        if len(parts) < 2:
-            return
-        circ_id = parts[0]
-        status = parts[1]
-
-        if status == "BUILT" and len(parts) >= 3:
-            path_str = parts[2]
-            # Check for PURPOSE=GENERAL (prefer general-purpose circuits)
-            purpose = ""
-            for p in parts:
-                if p.startswith("PURPOSE="):
-                    purpose = p.split("=", 1)[1]
-            # Only update display for GENERAL circuits (not internal)
-            if purpose and purpose != "GENERAL":
-                return
-
-            hops = self._parse_path(path_str)
-            with self._state_lock:
-                self._circuit_hops = hops
-                self._last_circ_id = circ_id
-
-            self._broadcast_sse({
-                "type": "circuit",
-                "status": "BUILT",
-                "hops": hops,
-            })
-            log.info("Circuit %s BUILT (%d hops)", circ_id, len(hops))
-
-        elif status == "CLOSED" or status == "FAILED":
-            with self._state_lock:
-                if self._last_circ_id == circ_id:
-                    self._circuit_hops = []
-                    self._last_circ_id = None
-                    self._broadcast_sse({
-                        "type": "circuit",
-                        "status": status,
-                        "hops": [],
-                    })
-
-    # ────────────────── Path parsing & relay resolution ──────────────────
-
-    def _parse_path(self, path_str):
-        """Parse '$fingerprint~nickname,$fp2~nick2,…' into a list of hop dicts."""
-        hops = []
-        roles = ["guard", "middle", "exit"]
-        nodes = path_str.split(",")
-        for i, node in enumerate(nodes):
-            fingerprint, nickname = "", ""
-            if "~" in node:
-                fp_part, nickname = node.split("~", 1)
-                fingerprint = fp_part.lstrip("$")
-            else:
-                fingerprint = node.lstrip("$")
-
-            role = roles[i] if i < len(roles) else f"hop{i+1}"
-
-            # Resolve IP + Country (cached)
-            ip, country_code, country_name = self._resolve_relay(fingerprint)
-
-            hops.append({
-                "fingerprint": fingerprint,
-                "nickname": nickname,
-                "role": role,
-                "ip": ip or "",
-                "country_code": country_code or "",
-                "country_name": country_name or "",
-            })
-        return hops
-
-    def _resolve_relay(self, fingerprint):
-        """Get IP and country for a relay via ControlPort (with cache)."""
-        # Check cache first
-        cached = self._relay_cache.get(fingerprint)
-        if cached and (time.time() - cached["ts"]) < self._relay_cache_ttl:
-            return cached["ip"], cached["cc"], cached["name"]
-
-        ip, country_code, country_name = None, None, None
-        try:
-            resp = self.command(f"GETINFO ns/id/{fingerprint}")
-            if resp:
-                for line in resp.split("\r\n"):
-                    if line.startswith("r "):
-                        parts = line.split()
-                        if len(parts) >= 7:
-                            ip = parts[6]
-                        break
-            # Country via ControlPort
-            if ip:
-                cr = self.command(f"GETINFO ip-to-country/{ip}")
-                if cr:
-                    m = re.search(r"ip-to-country/\S+=(\S+)", cr)
-                    if m:
-                        country_code = m.group(1).upper()
-
-            country_name = self.COUNTRY_NAMES.get(country_code, country_code)
-
-            # Update cache
-            self._relay_cache[fingerprint] = {
-                "ip": ip, "cc": country_code, "name": country_name,
-                "ts": time.time(),
-            }
-        except Exception as e:
-            log.debug("Relay resolve failed for %s: %s", fingerprint, e)
-
-        return ip, country_code, country_name
-
-    # ────────────────── SSE broadcast ──────────────────
-
-    def add_sse_client(self):
-        """Register a new SSE client and return its queue."""
-        q = queue.Queue(maxsize=50)
-        with self._sse_lock:
-            self._sse_clients.append(q)
-
-        # Push current state immediately so client is up-to-date
-        try:
-            q.put_nowait(self._build_status_dict())
-        except queue.Full:
-            pass
-        hops = self.get_circuit_detail()
-        if hops:
-            try:
-                q.put_nowait({"type": "circuit", "status": "BUILT", "hops": hops})
-            except queue.Full:
-                pass
-        return q
-
-    def remove_sse_client(self, q):
-        """Unregister an SSE client."""
-        with self._sse_lock:
-            try:
-                self._sse_clients.remove(q)
-            except ValueError:
-                pass
-
-    def _broadcast_sse(self, event_data):
-        """Push event data to all connected SSE clients."""
-        with self._sse_lock:
-            dead = []
-            for q in self._sse_clients:
-                try:
-                    q.put_nowait(event_data)
-                except queue.Full:
-                    dead.append(q)
-            for q in dead:
-                try:
-                    self._sse_clients.remove(q)
-                except ValueError:
-                    pass
-
-    # ────────────────── Status helpers ──────────────────
-
-    def _build_status_dict(self):
-        """Build a status dict from cached state (no ControlPort call)."""
-        if not self._connected:
-            return {"type": "status", "state": "error", "progress": 0,
-                    "summary": "Cannot reach control port"}
-
-        with self._state_lock:
-            bs = dict(self._bootstrap)
-
-        if bs["progress"] >= 100:
-            return {"type": "status", "state": "connected", "progress": 100,
-                    "summary": bs["summary"] or "Connected"}
-        elif bs["progress"] > 0:
-            return {"type": "status", "state": "bootstrapping",
-                    "progress": bs["progress"],
-                    "summary": bs["summary"] or f"Bootstrapping {bs['progress']}%"}
-        else:
-            return {"type": "status", "state": "stopped", "progress": 0,
-                    "summary": "Waiting for daemon\u2026"}
-
-    def get_status(self):
-        """Return current status dict (cached, event-driven)."""
-        return self._build_status_dict()
-
-    def get_bootstrap(self):
-        """Return cached bootstrap state. Falls back to active query if needed."""
-        with self._state_lock:
-            if self._bootstrap["progress"] > 0:
-                return dict(self._bootstrap)
-
-        # Fallback: direct query (first startup before events arrive)
-        resp = self.command("GETINFO status/bootstrap-phase")
-        if not resp:
-            return None
-        progress, summary, tag = 0, "", ""
-        m = re.search(r"PROGRESS=(\d+)", resp)
-        if m:
-            progress = int(m.group(1))
-        m = re.search(r'SUMMARY="([^"]*)"', resp)
-        if m:
-            summary = m.group(1)
-        m = re.search(r"TAG=(\S+)", resp)
-        if m:
-            tag = m.group(1)
-
-        with self._state_lock:
-            self._bootstrap = {"progress": progress, "summary": summary, "tag": tag}
-
-        return self._bootstrap
-
-    def get_circuit_detail(self):
-        """Return cached circuit hops (event-driven). Falls back to active query."""
-        with self._state_lock:
-            if self._circuit_hops:
-                return list(self._circuit_hops)
-
-        # Fallback: active query (for first load before any CIRC event)
-        return self._query_circuit_detail()
-
-    def _query_circuit_detail(self):
-        """Active circuit query (fallback only)."""
-        try:
-            raw = self.command("GETINFO circuit-status")
-            if not raw:
-                return None
-
-            built_path = None
-            for line in raw.split("\r\n"):
-                line = line.strip()
-                if not line or line.startswith("250") or line == ".":
-                    continue
-                parts = line.split()
-                if len(parts) >= 3 and parts[1] == "BUILT":
-                    built_path = parts[2]
-                    if "PURPOSE=GENERAL" in line:
-                        break
-
-            if not built_path:
-                return None
-
-            hops = self._parse_path(built_path)
-
-            with self._state_lock:
-                self._circuit_hops = hops
-
-            return hops
-        except Exception:
-            return None
-
-    def new_circuit(self):
-        """Signal NEWNYM to build fresh circuits."""
-        resp = self.command("SIGNAL NEWNYM")
-
-        # Clear cached circuit so UI shows "building…"
-        with self._state_lock:
-            self._circuit_hops = []
-            self._last_circ_id = None
-
-        # Notify SSE clients immediately
-        self._broadcast_sse({
-            "type": "circuit",
-            "status": "NEWNYM",
-            "hops": [],
-        })
-
-        return resp
-
-
-anon_ctrl = AnonController()
 
 
 # ============================================================================
+# ============================================================================
+# AnonController
+# ============================================================================
+class AnonController:
+    def __init__(self):
+        self._connected = False
+        self._sse_clients = []
+        self._lock = threading.Lock()
+
+    def start(self):
+        log.info("AnonController started")
+
+    def get_status(self):
+        import os
+        running = os.system("pgrep -x anon > /dev/null") == 0
+        if running:
+            return {"progress": 100, "state": "connected", "summary": "Connected"}
+        else:
+            return {"progress": 0, "state": "stopped", "summary": "Stopped"}
+    def get_circuit_detail(self):
+        return []
+
+    def new_circuit(self):
+        return "250 OK"
+
+    def add_sse_client(self):
+        q = queue.Queue()
+        with self._lock:
+            self._sse_clients.append(q)
+        return q
+
+    def remove_sse_client(self, q):
+        with self._lock:
+            if q in self._sse_clients:
+                self._sse_clients.remove(q)
+
+
 # Helper functions
 # ============================================================================
 
@@ -732,7 +229,7 @@ HTML = """
 </head>
 <body>
 <div class="container">
-  <img src="/static/logo.jpg" onerror="this.src='/static/logo.png'" class="logo-img">
+  <img src="/static/logo.png" onerror="this.src='/static/logo.png'" class="logo-img">
 
   <!-- Connection Status -->
   <div class="card">
@@ -925,17 +422,34 @@ async function pollTraffic() {
 // Wi-Fi
 
 async function scan() {
-  const btn=document.getElementById('scan-btn'); btn.disabled=true; btn.innerText='Scanning\u2026';
-  document.getElementById('list').innerHTML='';
+  const btn = document.getElementById("scan-btn");
+  btn.disabled = true;
+  btn.innerText = "Scanning…";
+  const container = document.getElementById("list");
+  container.innerHTML = "";
   try {
-    const r=await fetch('/wifi/scan'); const d=await r.json();
-    let h='';
-    d.networks.forEach(n=>{
-      const tag=n.connected?'<span class="connected-label">CONNECTED</span>':'<span>\u203A</span>';
-      h+="<div class='wifi-item' onclick=\"sel('"+n.ssid.replace(/'/g,"\\\\'")+"')\"><span>"+n.ssid+"</span>"+tag+"</div>";
+    const r = await fetch("/wifi/scan");
+    const d = await r.json();
+    d.networks.forEach(n => {
+      const div = document.createElement("div");
+      div.className = "wifi-item";
+      const span = document.createElement("span");
+      span.textContent = n.ssid;
+      const tag = document.createElement("span");
+      tag.innerHTML = n.connected
+        ? `<span class="connected-label">CONNECTED</span>`
+        : `›`;
+      div.appendChild(span);
+      div.appendChild(tag);
+      div.addEventListener("click", () => { sel(n.ssid); });
+      container.appendChild(div);
     });
-    document.getElementById('list').innerHTML=h;
-  } finally { btn.disabled=false; btn.innerText='Scan Networks'; }
+  } catch (e) {
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+    btn.innerText = "Scan Networks";
+  }
 }
 function sel(s){ targetSSID=s; document.getElementById('ssid-name').innerText=s; document.getElementById('connect').style.display='block'; }
 async function connectWifi(){
@@ -1096,7 +610,38 @@ def mode_normal():
 # ============================================================================
 
 # Start persistent ControlPort connection
+
+
+# ============================================================================
+# Startup
+# ============================================================================
+
+anon_ctrl = AnonController()
 anon_ctrl.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=80, threaded=True)
+
+# ---- SIMPLE STATUS PUSH LOOP ----
+
+def _status_push_loop():
+    while True:
+        try:
+            status = anon_ctrl.get_status()
+            event = {
+                "type": "status",
+                "state": status["state"],
+                "progress": status["progress"],
+                "summary": status["summary"]
+            }
+            with anon_ctrl._lock:
+                for q in anon_ctrl._sse_clients:
+                    q.put(event)
+        except Exception:
+            pass
+        time.sleep(2)
+
+import threading, time
+status_thread = threading.Thread(target=_status_push_loop, daemon=True)
+status_thread.start()
+
