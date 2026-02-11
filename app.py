@@ -43,6 +43,33 @@ EXIT_COUNTRIES = [
 ]
 
 
+# ISO country code → English name
+COUNTRY_NAME_MAP = {
+    "DE": "Germany",
+    "NL": "Netherlands",
+    "US": "United States",
+    "FR": "France",
+    "GB": "United Kingdom",
+    "ES": "Spain",
+    "IT": "Italy",
+    "PL": "Poland",
+    "SE": "Sweden",
+    "NO": "Norway",
+    "FI": "Finland",
+    "CH": "Switzerland",
+    "AT": "Austria",
+    "CZ": "Czech Republic",
+    "RO": "Romania",
+    "BG": "Bulgaria",
+    "HU": "Hungary",
+    "PT": "Portugal",
+    "CA": "Canada",
+    "AU": "Australia",
+    "JP": "Japan",
+    "SG": "Singapore"
+}
+
+
 # ============================================================================
 # AnonController v2 — Persistent connection with event support
 # ============================================================================
@@ -423,6 +450,8 @@ class AnonController:
                                 break
                     except Exception:
                         pass
+                    if not cn and cc:
+                        cn = COUNTRY_NAME_MAP.get(cc.upper(), "")
                     self._geo_cache[ip] = (cc, cn)
 
                 h["country_code"] = cc or ""
@@ -490,9 +519,84 @@ def set_exit_country(country_code):
     return True
 
 
-# ============================================================================
-# HTML Template
-# ============================================================================
+
+
+# ──────────────────────────────────────────────
+# Anyone Proof + Leak Detection
+# ──────────────────────────────────────────────
+ANYONE_CHECK_URL = "https://check.en.anyone.tech/"
+ANYONE_PROOF_TTL_SECONDS = 8
+
+_anyone_cache = {"ts": 0.0, "connected": False, "ip": "", "reason": "not_checked", "leak_ok": None, "leak_issues": []}
+
+def _privacy_mode_active() -> bool:
+    try:
+        return subprocess.run("sudo iptables -t nat -S PREROUTING | grep -q -- '--to-ports 9040'",
+                              shell=True, capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+
+def _anyone_proof_check():
+    """
+    Proof via anon SOCKS (127.0.0.1:9050) against check.en.anyone.tech.
+    """
+    global _anyone_cache
+    now = time.time()
+
+    if (now - float(_anyone_cache.get("ts", 0.0))) < ANYONE_PROOF_TTL_SECONDS:
+        return _anyone_cache
+
+    cmd = [
+        "curl", "-sS",
+        "--max-time", "6",
+        "--connect-timeout", "4",
+        "--socks5-hostname", "127.0.0.1:9050",
+        ANYONE_CHECK_URL
+    ]
+
+    connected = False
+    ip = ""
+    reason = "unknown"
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        body = (r.stdout or "") + "\n" + (r.stderr or "")
+
+        # CONNECTED (observed wording)
+        if re.search(r"congratulations\.|you\s+can\s+be\s+anyone", body, re.IGNORECASE):
+            connected = True
+            reason = "connected"
+        elif re.search(r"connected\s+to\s+anyone", body, re.IGNORECASE):
+            connected = True
+            reason = "connected"
+        # NOT CONNECTED
+        elif re.search(r"(sorry\.|not\s+connected).*anyone", body, re.IGNORECASE):
+            connected = False
+            reason = "not_connected"
+        elif r.returncode != 0:
+            connected = False
+            reason = f"curl_rc_{r.returncode}"
+        else:
+            connected = False
+            reason = "unrecognized_response"
+
+        m = re.search(r"ip address appears to be:\s*([0-9a-fA-F\.:]+)", body, re.IGNORECASE)
+        if m:
+            ip = m.group(1).strip()
+
+    except Exception as e:
+        connected = False
+        reason = f"exception:{e.__class__.__name__}"
+
+    _anyone_cache.update({
+        "ts": now,
+        "connected": bool(connected),
+        "ip": ip,
+        "reason": reason
+    })
+
+    return _anyone_cache
 
 
 # ──────────────────────────────────────────────
@@ -767,6 +871,39 @@ HTML = """
   .sse-dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-left:8px; vertical-align:middle; }
   .sse-dot.live { background:#03BDC5; box-shadow:0 0 6px #03BDC5; }
   .sse-dot.dead { background:#f85149; }
+
+  /* Anyone proof banner */
+  .proof-banner {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    z-index: 9999;
+    padding: 12px 14px;
+    font-weight: 900;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    text-align: center;
+    border-top: 1px solid rgba(255,255,255,0.10);
+    backdrop-filter: blur(8px);
+  }
+  .proof-banner.disconnected {
+    background: rgba(248,81,73,0.18);
+    color: #ff8a84;
+  }
+  .proof-banner.connected {
+    background: rgba(63,185,80,0.18);
+    color: #7ee787;
+  }
+  .proof-sub {
+    display:block;
+    margin-top: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    opacity: 0.95;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  body { padding-bottom: 70px; } /* keep content above banner */
+
 </style>
 </head>
 <body>
@@ -1017,8 +1154,49 @@ async function pollCircuit() {
   } catch(e) {}
 }
 
+
+
+// ──────────────────────────────────────────────
+// Anyone proof banner (connected/disconnected) + leak indicator
+// ──────────────────────────────────────────────
+let lastProof = null;
+
+function updateProofBanner(st) {
+  const b = document.getElementById('proof-banner');
+  const sub = document.getElementById('proof-sub');
+  if (!b || !sub) return;
+
+  const connected = !!(st && st.connected);
+  const ip = (st && st.ip) ? st.ip : '';
+  const reason = (st && st.reason) ? st.reason : 'unknown';
+  const privacy = !!(st && st.privacy);
+
+  b.className = 'proof-banner ' + (connected ? 'connected' : 'disconnected');
+  b.firstChild.nodeValue = connected ? 'Connected to Anyone' : 'Not connected to Anyone';
+
+  let msg = '';
+  if (!privacy) msg += 'Privacy mode is OFF. ';
+  if (ip) msg += `Exit IP: ${ip}. `;
+  
+  sub.textContent = msg.trim();
+}
+
+async function pollProof() {
+  try {
+    const r = await fetch('/api/anyone/proof', { cache: 'no-store' });
+    const st = await r.json();
+    lastProof = st;
+    updateProofBanner(st);
+  } catch (e) {
+    updateProofBanner({connected:false, ip:'', reason:'portal_error'});
+  }
+}
+
 // ──── Start: SSE for status+circuit, polling only for traffic ────
 connectSSE();
+pollProof();
+setInterval(pollProof, 5000);
+
 pollCircuit();
 setInterval(pollCircuit, 3000);
 pollTraffic();
@@ -1172,6 +1350,12 @@ document.addEventListener("DOMContentLoaded", () => {
       <div style="opacity:0.8;">(Existing connections stay alive; new ones use the new circuit)</div>
     </div>
   </div>
+
+<div id="proof-banner" class="proof-banner disconnected">
+  Not connected to Anyone
+  <span class="proof-sub" id="proof-sub">Checking…</span>
+</div>
+
 </body></html>
 """
 
@@ -1294,6 +1478,18 @@ def api_rotation_trigger():
     ok = rotation_mgr.trigger("manual")
     return jsonify({"ok": bool(ok), **rotation_mgr.get_state()}), 200
 
+
+
+
+# ──── Anyone Proof + Leakcheck ────
+
+@app.route("/api/anyone/proof", methods=["GET"])
+def api_anyone_proof():
+    st = _anyone_proof_check()
+    # also refresh leakcheck periodically (cheap enough)
+    st2 = dict(st)
+    st2.update({"privacy": _privacy_mode_active()})
+    return jsonify(st2), 200
 
 # ──── Debug helpers ────
 @app.route("/api/debug/routes", methods=["GET"])

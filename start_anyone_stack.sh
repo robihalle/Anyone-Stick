@@ -29,8 +29,6 @@ systemctl restart dnsmasq
 # 4. Start portal (Flask with threaded=True for SSE support)
 #    The app.py calls anon_ctrl.start() at module level, so the
 #    AnonController reconnect loop starts automatically.
-#    We use --timeout 0 to prevent gunicorn from killing SSE workers.
-#    Fallback: plain python3 with threaded=True (built into app.py).
 if command -v gunicorn &>/dev/null; then
     gunicorn --bind 0.0.0.0:80 \
              --workers 1 \

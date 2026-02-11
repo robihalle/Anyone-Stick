@@ -1,52 +1,44 @@
 #!/bin/bash
-# Anyone Privacy Stick – Privacy Mode (Kill Switch enabled)
+# Anyone Privacy Stick – Privacy Mode (NO-LEAK + Portal always reachable)
+set -euo pipefail
 
-# 1. Firewall Reset
+IN_IF="usb0"
+PI_IP="192.168.7.1"
+TRANS_PORT="9040"
+DNS_PORT="9053"
+
+# Reset
 iptables -F
 iptables -t nat -F
 iptables -t mangle -F
 
-# 2. Forwarding & IPv6 Kill
-sysctl -w net.ipv4.ip_forward=1
-sysctl -w net.ipv6.conf.all.disable_ipv6=1
-sysctl -w net.ipv6.conf.default.disable_ipv6=1
-sysctl -w net.ipv6.conf.lo.disable_ipv6=1
-
-# 3. DEFAULT POLICY: DROP everything (Kill Switch)
+# Privacy = no-leak forwarding
 iptables -P FORWARD DROP
+iptables -P INPUT ACCEPT
+iptables -P OUTPUT ACCEPT
 
-# 4. LOKALE AUSNAHMEN (Portal muss IMMER gehen)
-iptables -t nat -A PREROUTING -i usb0 -p tcp --dport 80 -j RETURN
-iptables -t nat -A PREROUTING -i usb0 -d 192.168.7.1 -j RETURN
+# IPv6 off
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=1 2>/dev/null || true
 
-# 5. DNS-FIX: Umleitung von 53 auf 9053 (Anyone DNS)
-iptables -t nat -A PREROUTING -i usb0 -p udp --dport 53 -j REDIRECT --to-ports 9053
-iptables -t nat -A PREROUTING -i usb0 -p tcp --dport 53 -j REDIRECT --to-ports 9053
+# Exempt ONLY traffic destined to the Pi itself (portal + local services)
+iptables -t nat -A PREROUTING -i "$IN_IF" -d "$PI_IP" -j RETURN
 
-# 6. TRANSPARENT PROXY: Alle anderen TCP-Anfragen in den Tunnel (9040)
-iptables -t nat -A PREROUTING -i usb0 -p tcp --syn -j REDIRECT --to-ports 9040
+# Force DNS to anon DNSPort
+iptables -t nat -A PREROUTING -i "$IN_IF" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+iptables -t nat -A PREROUTING -i "$IN_IF" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
 
-# 7. FORWARD: Nur established/related traffic erlauben (Kill Switch)
-iptables -A FORWARD -i usb0 -o wlan0 -j ACCEPT
-iptables -A FORWARD -i wlan0 -o usb0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+# Force ALL TCP to anon TransPort (no port-80 exemption!)
+iptables -t nat -A PREROUTING -i "$IN_IF" -p tcp -j REDIRECT --to-ports "$TRANS_PORT"
 
-# 8. ROUTING & MTU
-iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
+# Prevent UDP leaks (QUIC/WebRTC etc.) – DNS is redirected anyway
+iptables -A FORWARD -i "$IN_IF" -p udp -j DROP
+
+# Optional MSS clamp
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# 9. Block all non-tunnel UDP (except DNS redirect) – prevents UDP leaks
-iptables -A FORWARD -i usb0 -p udp --dport 53 -j ACCEPT
-iptables -A FORWARD -i usb0 -p udp -j DROP
-
-# 10. MAC Randomization (if enabled)
-if [ -f /var/lib/anyone-stick/mac_random_enabled ]; then
-    ip link set wlan0 down
-    macchanger -r wlan0 2>/dev/null || true
-    ip link set wlan0 up
-fi
-
-# 11. Kill Switch marker
+mkdir -p /var/lib/anyone-stick
 touch /var/lib/anyone-stick/killswitch_active
-
-# 12. LED & Status
-echo heartbeat | sudo tee /sys/class/leds/default-on/trigger
+echo heartbeat | tee /sys/class/leds/default-on/trigger >/dev/null 2>&1 || true
