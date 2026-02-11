@@ -7,6 +7,7 @@
 from flask import Flask, request, jsonify, render_template_string, redirect, Response
 import subprocess, time, os, signal, re, socket, threading, queue, json, logging
 
+from pathlib import Path
 app = Flask(__name__, static_folder="static")
 log = logging.getLogger("anyone-stick")
 logging.basicConfig(level=logging.INFO,
@@ -52,37 +53,355 @@ EXIT_COUNTRIES = [
 # AnonController
 # ============================================================================
 class AnonController:
+    """
+    Robust ControlPort controller:
+    - One persistent socket for async events (SETEVENTS CIRC STATUS_CLIENT)
+    - Separate one-shot socket for GETINFO / SIGNAL to avoid races with event reader
+    """
+    CONTROL_HOST = "127.0.0.1"
+    CONTROL_PORT = 9051
+    COOKIEFILE   = "/var/lib/anon/control_auth_cookie"
+
     def __init__(self):
-        self._connected = False
-        self._sse_clients = []
         self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._sse_clients = []
+
+        self._connected = False
+        self._bootstrap = {"progress": 0, "summary": "Starting…"}
+        self._circuit_hops = []
+        self._last_circ_ts = 0.0
+
+        self._stop = threading.Event()
+        self._thr = None
+
+        self._ns_cache = {}   # fp -> (nickname, ip)
+        self._geo_cache = {}  # ip -> (cc, country_name)
 
     def start(self):
-        log.info("AnonController started")
+        if self._thr and self._thr.is_alive():
+            return
+        self._thr = threading.Thread(target=self._run, name="anonctl", daemon=True)
+        self._thr.start()
+        log.info("AnonController started (ControlPort reconnect loop running)")
 
     def get_status(self):
-        import os
-        running = os.system("pgrep -x anon > /dev/null") == 0
-        if running:
-            return {"progress": 100, "state": "connected", "summary": "Connected"}
-        else:
-            return {"progress": 0, "state": "stopped", "summary": "Stopped"}
+        try:
+            running = (subprocess.run(["pgrep","-x","anon"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0)
+        except Exception:
+            running = False
+
+        with self._state_lock:
+            hops = list(self._circuit_hops)
+            bs = dict(self._bootstrap)
+
+        if running and hops:
+            return {"type":"status","state":"connected","progress":100,"summary":"Connected"}
+
+        if not running:
+            return {"type":"status","state":"stopped","progress":0,"summary":"Stopped"}
+
+        p = int(bs.get("progress") or 0)
+        p = 1 if p <= 0 else p
+        p = max(1, min(p, 99)) if p < 100 else 100
+        summ = bs.get("summary") or ("Bootstrapping %d%%" % p)
+        return {"type":"status","state":"bootstrapping" if p < 100 else "connected",
+                "progress": p, "summary": summ}
+
     def get_circuit_detail(self):
-        return []
+        # Ensure UI gets hops even if no CIRC events arrive
+        now = time.time()
+        with self._state_lock:
+            hops = list(self._circuit_hops)
+            last = float(self._last_circ_ts or 0.0)
+        if (not hops) or (now - last > 5.0):
+            try:
+                self._refresh_circuit_from_getinfo()
+            except Exception:
+                pass
+            with self._state_lock:
+                hops = list(self._circuit_hops)
+        return hops
+
+    def _parse_path_to_hops(self, path: str):
+        # PATH token from ControlPort can be like:
+        #   =Nick,=Nick,=Nick
+        # or (your case):
+        #   ~Nick,~Nick,~Nick
+        items = [x.strip() for x in (path or "").split(",") if x.strip()]
+        roles = ["entry", "middle", "exit"]
+        hops = []
+        for idx, it in enumerate(items[:3]):
+            fp = ""; nick = ""
+            it = it.strip()
+            if it.startswith(""):
+                it2 = it[1:]
+                if "=" in it2:
+                    fp, nick = it2.split("=", 1)
+                elif "~" in it2:
+                    fp, nick = it2.split("~", 1)
+                else:
+                    fp = it2
+            else:
+                # fallback if format changes
+                fp = it
+
+            fp = fp.strip()
+            nick = (nick or "").strip()
+            # Some formats may embed nick into fp accidentally
+            if "~" in fp and not nick:
+                fp, nick = fp.split("~", 1)
+                fp = fp.strip(); nick = nick.strip()
+
+            hops.append({
+                "role": roles[idx] if idx < len(roles) else f"hop{idx+1}",
+                "fingerprint": fp,
+                "nickname": nick,
+                "ip": "",
+                "country_code": "",
+                "country_name": "",
+            })
+        return hops
+
+    def _refresh_circuit_from_getinfo(self):
+        # Pull latest built circuit from ControlPort even without events
+        rep = self._one_shot(["GETINFO circuit-status"], timeout=3)
+        # Expect lines like: 250+circuit-status=
+        # <id> BUILT =nick,=nick PURPOSE=GENERAL
+        # .
+        best_path = ""
+        for ln in rep.splitlines():
+            ln = ln.strip()
+            if (" BUILT " in ln) and ("" in ln):
+                # take the PATH token right after BUILT
+                try:
+                    rest = ln.split(" BUILT ", 1)[1]
+                    best_path = rest.split(" ", 1)[0]
+                except Exception:
+                    continue
+        if not best_path:
+            return
+        hops = self._parse_path_to_hops(best_path)
+        hops = self._enrich_hops(hops)
+        with self._state_lock:
+            self._circuit_hops = hops
+            self._last_circ_ts = time.time()
+        self._push({"type":"circuit","status":"REFRESH","hops":hops})
 
     def new_circuit(self):
-        return "250 OK"
+        r = self.command("SIGNAL NEWNYM")
+        self._push({"type":"circuit", "status":"NEWNYM", "hops":[]})
+        return r
 
     def add_sse_client(self):
         q = queue.Queue()
         with self._lock:
             self._sse_clients.append(q)
+        try:
+            q.put_nowait(self.get_status())
+            q.put_nowait({"type":"circuit","status":"SNAPSHOT","hops":self.get_circuit_detail()})
+        except Exception:
+            pass
         return q
 
     def remove_sse_client(self, q):
         with self._lock:
             if q in self._sse_clients:
                 self._sse_clients.remove(q)
+
+    def _push(self, evt: dict):
+        with self._lock:
+            for q in list(self._sse_clients):
+                try:
+                    q.put_nowait(evt)
+                except Exception:
+                    pass
+
+    def _read_cookie_hex(self) -> str:
+        return Path(self.COOKIEFILE).read_bytes().hex()
+
+    def _read_reply_lines(self, f) -> str:
+        out = []
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            s = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            out.append(s)
+            if s.startswith("250-"):
+                continue
+            if s.startswith(("250 ", "250 OK", "250 closing", "4", "5", "515 ")):
+                break
+        return "\n".join(out)
+
+    def _one_shot(self, cmds, timeout=3) -> str:
+        import socket
+        cookie = self._read_cookie_hex()
+        with socket.create_connection((self.CONTROL_HOST, self.CONTROL_PORT), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            f = sock.makefile("rwb", buffering=0)
+            f.write(("AUTHENTICATE %s\r\n" % cookie).encode("utf-8"))
+            f.flush()
+            auth = self._read_reply_lines(f)
+            if "250" not in auth:
+                return auth
+
+            rep = ""
+            for c in cmds:
+                f.write((c + "\r\n").encode("utf-8"))
+                f.flush()
+                rep = self._read_reply_lines(f)
+
+            f.write(b"QUIT\r\n")
+            f.flush()
+            return rep
+
+    def command(self, cmd: str, timeout=3) -> str:
+        return self._one_shot([cmd], timeout=timeout)
+
+    def _run(self):
+        import socket
+        while not self._stop.is_set():
+            sock = None
+            try:
+                sock = socket.create_connection((self.CONTROL_HOST, self.CONTROL_PORT), timeout=3)
+                sock.settimeout(30)
+                f = sock.makefile("rwb", buffering=0)
+
+                cookie = self._read_cookie_hex()
+                f.write(("AUTHENTICATE %s\r\n" % cookie).encode("utf-8"))
+                f.flush()
+                auth = self._read_reply_lines(f)
+                if "250" not in auth:
+                    log.warning("AUTH failed: %s", auth)
+                    time.sleep(1.5)
+                    continue
+
+                f.write(b"SETEVENTS CIRC STATUS_CLIENT\r\n")
+                f.flush()
+                rep = self._read_reply_lines(f)
+                if "250" not in rep:
+                    log.warning("SETEVENTS failed: %s", rep)
+                else:
+                    log.info("Subscribed to CIRC + STATUS_CLIENT events")
+
+                self._push(self.get_status())
+                self._push({"type":"circuit","status":"SNAPSHOT","hops":self.get_circuit_detail()})
+
+                while not self._stop.is_set():
+                    line = f.readline()
+                    if not line:
+                        raise RuntimeError("EOF from ControlPort")
+                    sline = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if sline.startswith("650 "):
+                        self._handle_async(sline)
+
+            except Exception as e:
+                log.exception("Reader loop exited — marking disconnected: %s", e)
+                time.sleep(1.5)
+            finally:
+                try:
+                    if sock: sock.close()
+                except Exception:
+                    pass
+
+    def _handle_async(self, sline: str):
+        try:
+            if sline.startswith("650 STATUS_CLIENT") and " BOOTSTRAP " in sline:
+                m1 = re.search(r"PROGRESS=(\d+)", sline)
+                m2 = re.search(r'SUMMARY="([^"]+)"', sline)
+                p = int(m1.group(1)) if m1 else 1
+                summ = m2.group(1) if m2 else ("Bootstrapping %d%%" % p)
+                with self._state_lock:
+                    self._bootstrap = {"progress": p, "summary": summ}
+                self._push({"type":"status","state":"bootstrapping" if p < 100 else "connected",
+                            "progress": max(1, min(p, 100)), "summary": summ})
+                return
+
+            if sline.startswith("650 CIRC ") and " BUILT " in sline:
+                parts = sline.split(" BUILT ", 1)
+                if len(parts) < 2:
+                    return
+                rest = parts[1]
+                path = rest.split(" ", 1)[0]
+                items = [x for x in path.split(",") if x]
+                roles = ["entry", "middle", "exit"]
+                hops = []
+                for idx, it in enumerate(items[:3]):
+                    fp = ""
+                    nick = ""
+                    if it.startswith("$"):
+                        it2 = it[1:]
+                        if "=" in it2:
+                            fp, nick = it2.split("=", 1)
+                        else:
+                            fp = it2
+                    hops.append({
+                        "role": roles[idx],
+                        "fingerprint": fp,
+                        "nickname": nick,
+                        "ip": "",
+                        "country_code": "",
+                        "country_name": "",
+                    })
+
+                hops = self._enrich_hops(hops)
+                with self._state_lock:
+                    self._circuit_hops = hops
+
+                log.info("Circuit BUILT (%d hops)", len(hops))
+                self._push({"type":"circuit","status":"BUILT","hops":hops})
+                self._push(self.get_status())
+                return
+        except Exception:
+            pass
+
+    def _enrich_hops(self, hops):
+        for h in hops:
+            fp = (h.get("fingerprint") or "").strip()
+            if not fp:
+                continue
+
+            if fp in self._ns_cache:
+                nick, ip = self._ns_cache[fp]
+            else:
+                nick, ip = (h.get("nickname") or ""), ""
+                try:
+                    rep = self._one_shot([f"GETINFO ns/id/{fp}"], timeout=3)
+                    for ln in rep.splitlines():
+                        ln = ln.strip()
+                        if ln.startswith("r "):
+                            toks = ln.split()
+                            if len(toks) >= 7:
+                                nick = toks[1]
+                                ip = toks[-3]
+                            break
+                    self._ns_cache[fp] = (nick, ip)
+                except Exception:
+                    pass
+
+            if nick:
+                h["nickname"] = nick
+            if ip:
+                h["ip"] = ip
+                if ip in self._geo_cache:
+                    cc, cn = self._geo_cache[ip]
+                else:
+                    cc, cn = "", ""
+                    try:
+                        rep2 = self._one_shot([f"GETINFO ip-to-country/{ip}"], timeout=3)
+                        for ln in rep2.splitlines():
+                            if "ip-to-country/" in ln and "=" in ln:
+                                cc = ln.split("=", 1)[1].strip()
+                                break
+                    except Exception:
+                        pass
+                    self._geo_cache[ip] = (cc, cn)
+
+                h["country_code"] = cc or ""
+                h["country_name"] = cn or ""
+        return hops
 
 
 # Helper functions
@@ -463,8 +782,21 @@ async function connectWifi(){
   finally { btn.disabled=false; btn.innerText='Connect Now'; }
 }
 
+
+// Circuit polling fallback (ensures auto-refresh even if no CIRC events arrive)
+async function pollCircuit() {
+  try {
+    const r = await fetch('/api/anon/circuit');
+    const d = await r.json();
+    // Reuse the same renderer used by SSE events
+    updateCircuit({ type: 'circuit', status: 'POLL', hops: (d.hops || []) });
+  } catch(e) {}
+}
+
 // ──── Start: SSE for status+circuit, polling only for traffic ────
 connectSSE();
+pollCircuit();
+setInterval(pollCircuit, 3000);
 pollTraffic();
 setInterval(pollTraffic, 1000);
 </script>
@@ -569,7 +901,7 @@ def w_scan():
     raw = subprocess.check_output("nmcli -t -f SSID,ACTIVE dev wifi list",
                                   shell=True).decode("utf-8")
     nets, seen = [], set()
-    for line in raw.split("\n"):
+    for line in raw.split("\r\n"):
         if line.strip():
             parts = line.split(":", 1)
             ssid = parts[0]
@@ -621,27 +953,4 @@ anon_ctrl.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=80, threaded=True)
-
-# ---- SIMPLE STATUS PUSH LOOP ----
-
-def _status_push_loop():
-    while True:
-        try:
-            status = anon_ctrl.get_status()
-            event = {
-                "type": "status",
-                "state": status["state"],
-                "progress": status["progress"],
-                "summary": status["summary"]
-            }
-            with anon_ctrl._lock:
-                for q in anon_ctrl._sse_clients:
-                    q.put(event)
-        except Exception:
-            pass
-        time.sleep(2)
-
-import threading, time
-status_thread = threading.Thread(target=_status_push_loop, daemon=True)
-status_thread.start()
 
