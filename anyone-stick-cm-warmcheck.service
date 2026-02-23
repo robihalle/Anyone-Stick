@@ -1,0 +1,6 @@
+[Unit]
+Description=Anyone Stick CM Warmcheck
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cm_warmcheck.sh

@@ -6,6 +6,12 @@
 
 echo timer | sudo tee /sys/class/leds/default-on/trigger >/dev/null
 
+# 0. Ensure NORMAL mode on boot (internet passthrough by default)
+#    Privacy should only be enabled via the web UI button.
+if [ -x /usr/local/bin/mode_normal.sh ]; then
+    /usr/local/bin/mode_normal.sh || true
+fi
+
 # 1. Wait for usb0 (max 5s)
 for i in $(seq 1 10); do
     ip link show usb0 &>/dev/null && break
@@ -51,4 +57,35 @@ for i in $(seq 1 30); do
 done
 
 # 7. Start anon (blocks — keeps service alive)
-/usr/local/bin/anon -f /etc/anonrc
+
+# 7. Default boot behavior: NORMAL MODE (allow all traffic)
+#    This ensures the host PC has internet immediately.
+if [ -x /usr/local/bin/mode_normal.sh ]; then
+    /usr/local/bin/mode_normal.sh >/dev/null 2>&1 || true
+fi
+
+# Ensure KillSwitch is OFF by default (user enables it explicitly)
+if [ -x /usr/local/bin/anyone_killswitch.sh ]; then
+    /usr/local/bin/anyone_killswitch.sh off >/dev/null 2>&1 || true
+fi
+
+# 7. Start anon (blocks — keeps service alive)
+#
+# IMPORTANT: avoid double-start races.
+# systemd may restart this service quickly; a previous anon instance can still
+# hold ports or leave a stale lock -> new anon crashes (free(): invalid pointer).
+echo "[boot] Ensuring no stale anon instance is running..."
+pkill -f "^/usr/local/bin/anon($|[[:space:]])" 2>/dev/null || true
+
+# Give kernel time to release listening sockets
+for i in $(seq 1 10); do
+    ss -lnt 2>/dev/null | grep -Eq ":(9040|9050|9051|9053)([[:space:]]|$)" || break
+    sleep 0.3
+done
+
+# Remove stale lock if present (safe when no instance running)
+rm -f /var/lib/anon/lock 2>/dev/null || true
+
+echo "[boot] Starting anon..."
+exec /usr/local/bin/anon -f /etc/anonrc
+

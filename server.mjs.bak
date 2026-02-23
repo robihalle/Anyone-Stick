@@ -1,0 +1,699 @@
+import express from "express";
+import fs from "fs";
+
+// Prefer named exports (this branch provides them). Keep fallback for odd bundlers.
+import * as Anyone from "@anyone-protocol/anyone-client";
+const Control = Anyone.Control || Anyone.default?.Control;
+const StateManager = Anyone.StateManager || Anyone.default?.StateManager;
+const VPNManager = Anyone.VPNManager || Anyone.default?.VPNManager;
+
+if (!Control || !StateManager || !VPNManager) {
+  throw new Error("Failed to import Control/StateManager/VPNManager from @anyone-protocol/anyone-client");
+}
+
+const HOST = process.env.MGR_HOST || "127.0.0.1";
+const PORT = parseInt(process.env.MGR_PORT || "8787", 10);
+
+// Defaults (can be overridden via env)
+const DEFAULT_EXIT_COUNTRIES = (process.env.MGR_EXIT_COUNTRIES || "DE")
+  .split(",")
+  .map(s => s.trim().toUpperCase())
+  .filter(Boolean);
+
+// Runtime override (set via POST /exit)
+const DEFAULT_MIN = parseInt(process.env.MGR_MIN_CIRCS || "1", 10);
+const DEFAULT_MAX = parseInt(process.env.MGR_MAX_CIRCS || "3", 10);
+const DEFAULT_TARGETS = (process.env.MGR_TARGETS || "ip-api.com,api.ipify.org,ipinfo.io").split(",").map(s=>s.trim()).filter(Boolean);
+
+const COOKIE_PATH = process.env.MGR_COOKIE_PATH || "/var/lib/anon/control_auth_cookie";
+
+let hopCount = parseInt(process.env.MGR_HOPCOUNT || "3", 10);
+if (![2,3].includes(hopCount)) hopCount = 3;
+
+let control;
+let stateManager;
+let vpnManager;
+
+// ---- Relay index (from StateManager) ----
+let _relayByFp = new Map();
+let _countryByIp = new Map(); // ip -> { code, ts }
+
+// ---- Circuit cache (fast HTTP responses) ----
+let _cacheCircuits = [];
+let _cacheCircuitsTs = 0;
+let _cacheRefreshing = false;
+let _cacheTimer = null;
+
+// ---- Relay info caches (fingerprint -> ip/country) ----
+let _relayInfoCache = new Map(); // fp -> { ip, nickname?, ts }
+let _relayCountryCache = new Map(); // ip -> { code, name, ts }
+
+// ---- Exit countries override (authoritative via /exit) ----
+let CURRENT_EXIT_COUNTRIES = null; // null=DEFAULT, []=no restriction, ["NL"]=restrict
+
+function readCookieHex(path) {
+  const buf = fs.readFileSync(path);
+  return Buffer.from(buf).toString("hex");
+}
+
+async function authenticateWithCookie(ctrl) {
+  const fs = await import("fs/promises");
+  const cookiePath = COOKIE_PATH;
+  const raw = await fs.readFile(cookiePath);
+  const hex = Buffer.from(raw).toString("hex").trim();
+  if (!hex) throw new Error("control_auth_cookie is empty");
+
+  const cmd = `AUTHENTICATE ${hex}`;
+
+  if (!ctrl || typeof ctrl.msgAsync !== "function") {
+    const keys = ctrl ? Object.keys(ctrl).sort() : [];
+    throw new Error(`Control object has no msgAsync(). Keys: ${keys.join(", ")}`);
+  }
+
+  // Send raw cookie AUTH (no quotes)
+  await ctrl.msgAsync(cmd);
+
+  // Wait for response exactly like Control.authenticate() does internally
+  const timeoutMs = 10000;
+  const resp = await Promise.race([
+    (ctrl.defaultQueue && typeof ctrl.defaultQueue.pop === "function")
+      ? ctrl.defaultQueue.pop()
+      : Promise.reject(new Error("Control.defaultQueue.pop() not available")),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout waiting for authentication response")), timeoutMs))
+  ]);
+
+  if (typeof resp !== "string") {
+    throw new Error(`Unexpected auth response type: ${typeof resp}`);
+  }
+
+  if (resp.startsWith("250 OK")) {
+    // IMPORTANT: mark authenticated (private in TS, but runtime property in JS)
+    ctrl.isAuthenticated = true;
+    console.log("Authenticated to Anon Control Port (cookie)");
+    return;
+  }
+  if (resp.startsWith("515")) {
+    throw new Error("Authentication failed (515)");
+  }
+  throw new Error(`Unexpected response: ${resp}`);
+
+}
+
+
+function effectiveExitCountries(){
+  try {
+    const want = (DEFAULT_EXIT_COUNTRIES || []).filter(Boolean);
+    if (!want.length) return null; // no restriction
+    const have = stateManager?.getAvailableCountries?.()?.length ?? 0;
+    if (!have) return null; // countries not ready yet -> fallback
+    return want;
+  } catch {
+    return null;
+  }
+}
+
+function _effectiveExitCountries(){
+  return (CURRENT_EXIT_COUNTRIES === null) ? DEFAULT_EXIT_COUNTRIES : CURRENT_EXIT_COUNTRIES;
+}
+
+function buildTargets(hops){
+  // Build per-target config; allow per-target exit countries override via MGR_EXIT_COUNTRIES
+  return DEFAULT_TARGETS.map(address => ({
+    address,
+    exitCountries: _effectiveExitCountries(),
+    minCircuits: DEFAULT_MIN,
+    maxCircuits: DEFAULT_MAX,
+    hopCount: (hops === 2 ? 2 : 3)
+  }));
+}
+
+async function initManagers() {
+  // Connect Control (Anon must already be running)
+  control = new Control("127.0.0.1", 9051);
+  await authenticateWithCookie(control);
+
+  // StateManager: relay cache + country population (as in your example)
+  stateManager = new StateManager(control, {
+    autoSubscribeEvents: false,
+    cacheRelays: true,
+    populateCountries: true,
+  });
+  await stateManager.initialize();
+
+  // Build relay index for hop enrichment
+  try {
+    const relays = stateManager?.getRelays?.() || [];
+    _relayByFp = new Map(relays.map(r => [r.fingerprint, r]));
+  } catch {}
+
+  await rebuildVPNManager(hopCount);
+  // resume background resolution after vpnManager initialize (example does this)
+  if (stateManager.resumeBackgroundResolution) stateManager.resumeBackgroundResolution();
+  _startCircuitCache();
+}
+
+async function _closeGeneralCircuits(maxClose=50){
+  // Force new circuits to be built (exit-country changes otherwise appear "sticky")
+  if (!control || typeof control.circuitStatus !== "function") return 0;
+  try {
+    const circs = await control.circuitStatus();
+    const generalBuilt = (circs || []).filter(c => {
+      const purpose = String(c?.purpose || "").toUpperCase();
+      const state = String(c?.state || "");
+      // keep it conservative: only close BUILT GENERAL circuits
+      return purpose === "GENERAL" && state.startsWith("BUILT");
+    });
+
+    // close newest first (best-effort)
+    let closed = 0;
+    for (let i = generalBuilt.length - 1; i >= 0; i--){
+      if (closed >= maxClose) break;
+      const id = generalBuilt[i]?.circuitId;
+      if (id === undefined || id === null) continue;
+      try { await control.msgAsync(`CLOSECIRCUIT ${id}`); closed++; } catch {}
+    }
+    return closed;
+  } catch {
+    return 0;
+  }
+}
+
+async function rebuildVPNManager(newHopCount){
+  _stopCircuitCache();
+  if (![2,3].includes(newHopCount)) throw new Error("hopCount must be 2 or 3");
+
+  // Close existing GENERAL circuits so exit-country/hop changes take effect immediately
+  try { await _closeGeneralCircuits(50); } catch {}
+
+  // Stop previous manager cleanly if possible
+  try {
+    if (vpnManager?.shutdown) await vpnManager.shutdown();
+    else if (vpnManager?.stop) await vpnManager.stop();
+  } catch {}
+
+  hopCount = newHopCount;
+
+  vpnManager = new VPNManager(stateManager, {
+    targets: buildTargets(hopCount),
+    healthMonitorInterval: 30000,
+    disablePredictedCircuits: true,
+    disableConflux: true,
+  });
+
+  await vpnManager.initialize();
+
+  // Ask anon for a fresh identity + close again (belt & suspenders)
+  try { await control.msgAsync("SIGNAL NEWNYM"); } catch {}
+  try { await _closeGeneralCircuits(50); } catch {}
+
+  _startCircuitCache();
+}
+
+
+async function _getRelayIp(fp){
+  if (!fp) return "";
+  const now = Date.now();
+  const hit = _relayInfoCache.get(fp);
+  if (hit && (now - hit.ts) < 6*60*60*1000) return hit.ip || "";
+  try {
+    const info = await control.getRelayInfo(fp);
+    const ip = (info && info.ip) ? String(info.ip) : "";
+    _relayInfoCache.set(fp, { ip, ts: now });
+    return ip;
+  } catch {
+    return (hit && hit.ip) ? hit.ip : "";
+  }
+}
+
+async function _getIpCountry(ip){
+  if (!ip) return { code:"", name:"" };
+  const now = Date.now();
+  const hit = _relayCountryCache.get(ip);
+  if (hit && (now - hit.ts) < 24*60*60*1000) return { code: hit.code || "", name: hit.name || "" };
+  try {
+    const code = await control.getCountry(ip);
+    const cc = code ? String(code).toUpperCase() : "";
+    // Name mapping minimal (optional). If not available, keep empty.
+    const name = "";
+    _relayCountryCache.set(ip, { code: cc, name, ts: now });
+    return { code: cc, name };
+  } catch {
+    return hit ? { code: hit.code || "", name: hit.name || "" } : { code:"", name:"" };
+  }
+}
+
+async function _enrichHop(h){
+  const ip = await _getRelayIp(h.fingerprint);
+  const c = await _getIpCountry(ip);
+  return { ...h, ip: ip || "", country_code: c.code || "", country_name: c.name || "" };
+}
+
+async function _enrichCircuit(c){
+  if (!c || !Array.isArray(c.hops)) return c;
+  // enrich sequentially (small list: 2-3 hops)
+  const hops = [];
+  for (const h of c.hops) hops.push(await _enrichHop(h));
+  return { ...c, hops };
+}
+function hopRole(i){
+  return i === 0 ? "entry" : (i === 1 ? "middle" : "exit");
+}
+
+function circuitsToApi(circuits){
+  const now = Date.now()/1000;
+  const out = [];
+  for (const c of (circuits || [])) {
+    const purpose = String(c.purpose || "").toUpperCase();
+    // Most user-facing browsing uses GENERAL; keep it tight for performance/UI clarity
+    if (purpose && purpose !== "GENERAL") continue;
+    const tc = (c.timeCreated instanceof Date && !isNaN(c.timeCreated.valueOf())) ? (c.timeCreated.getTime()/1000) : now;
+    out.push({
+      id: String(c.circuitId),
+      status: String(c.state || ""),
+      purpose,
+      first_seen_ts: tc,
+      age_seconds: Math.max(0, now - tc),
+      hops: (c.relays || []).map((r, idx) => ({
+        role: hopRole(idx),
+        fingerprint: r.fingerprint || "",
+        nickname: r.nickname || "",
+        ip: "",
+        country_code: "",
+        country_name: ""
+      }))
+    });
+  }
+  return out;
+}
+
+
+async function _liveBuiltGeneralCircuits(){
+  // Fallback path if cache is empty or stale:
+  // pull circuitStatus directly and convert to API shape
+  try {
+    if (!control || typeof control.circuitStatus !== "function") return [];
+    const circs = await control.circuitStatus();
+    const out = circuitsToApi(circs).filter(c => String(c.status).startsWith("BUILT"));
+    out.sort((a,b) => a.first_seen_ts - b.first_seen_ts);
+    // enrich newest few
+    const start = Math.max(0, out.length - 10);
+    for (let i = start; i < out.length; i++) out[i] = _enrichCircuitSync(out[i]);
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+
+
+
+
+async function _countryForIp(ip){
+  if (!ip) return "";
+  const now = Date.now();
+  const hit = _countryByIp.get(ip);
+  if (hit && (now - hit.ts) < 24*60*60*1000) return hit.code || "";
+  try {
+    const code = await control.getCountry(ip);
+    const cc = code ? String(code).toUpperCase() : "";
+    _countryByIp.set(ip, { code: cc, ts: now });
+    return cc;
+  } catch {
+    return (hit && hit.code) ? hit.code : "";
+  }
+}
+
+function _isoName(code){
+  const cc = String(code || "").trim().toUpperCase();
+  if (!cc) return "";
+
+  // Prefer Intl.DisplayNames (covers basically all ISO-3166 codes)
+  try {
+    const dn = new Intl.DisplayNames(["en"], { type: "region" });
+    const name = dn.of(cc);
+    if (name && typeof name === "string") return name;
+  } catch {}
+
+  // Small fallback map for common ones (in case Intl isn't available)
+  const FALLBACK = {
+    DE: "Germany", NL: "Netherlands", BE: "Belgium", FR: "France", ES: "Spain",
+    IT: "Italy", AT: "Austria", CH: "Switzerland", GB: "United Kingdom", UK: "United Kingdom",
+    US: "United States", CA: "Canada", SE: "Sweden", NO: "Norway", DK: "Denmark",
+    FI: "Finland", PL: "Poland", CZ: "Czechia", SK: "Slovakia", SI: "Slovenia",
+    HU: "Hungary", RO: "Romania", BG: "Bulgaria", GR: "Greece", PT: "Portugal",
+    IE: "Ireland", HR: "Croatia"
+  };
+  return FALLBACK[cc] || "";
+}
+
+function _enrichCircuitSync(c){
+  if (!c || !Array.isArray(c.hops)) return c;
+  const hops = c.hops.map(h => {
+    const fp = h.fingerprint || "";
+    const r = fp ? _relayByFp.get(fp) : null;
+    const ip = r?.ip || r?.address || r?.ipv4 || "";
+    const cc = (r?.countryCode || r?.country || r?.country_code || "").toString().toUpperCase();
+    const cn = (r?.countryName || r?.country_name || _isoName(cc) || "");
+    return { ...h, ip, country_code: cc, country_name: cn };
+  });
+  return { ...c, hops };
+}
+async function _refreshCircuitCache(){
+  if (_cacheRefreshing) return;
+  _cacheRefreshing = true;
+  try {
+    const circs = await control.circuitStatus();
+    const out = circuitsToApi(circs).filter(c => String(c.status).startsWith("BUILT"));
+    out.sort((a,b) => a.first_seen_ts - b.first_seen_ts);
+
+    // enrich newest few from StateManager relay index
+    const start = Math.max(0, out.length - 10);
+    for (let i = start; i < out.length; i++) out[i] = _enrichCircuitSync(out[i]);
+
+    // Fill missing country_code via control.getCountry(ip) (cached)
+    for (let i = start; i < out.length; i++) {
+      const c = out[i];
+      if (!c || !Array.isArray(c.hops)) continue;
+      for (let h = 0; h < c.hops.length; h++) {
+        const hop = c.hops[h];
+        if (!hop) continue;
+        if ((!hop.country_code || hop.country_code === "") && hop.ip) {
+          const cc = await _countryForIp(hop.ip);
+          if (cc) {
+            hop.country_code = cc;
+            hop.country_name = hop.country_name || _isoName(cc) || "";
+          }
+        }
+        // If country_code exists but name is missing, fill it
+        if (hop.country_code && (!hop.country_name || hop.country_name === "")) {
+          hop.country_name = _isoName(hop.country_code) || "";
+        }
+      }
+    }
+
+    _cacheCircuits = out;
+    _cacheCircuitsTs = Date.now()/1000;
+  } catch (e) {
+    // keep last cache
+  } finally {
+    _cacheRefreshing = false;
+  }
+}
+
+function _stopCircuitCache(){
+  if (_cacheTimer) {
+    try { clearInterval(_cacheTimer); } catch {}
+    _cacheTimer = null;
+  }
+}
+
+function _startCircuitCache(){
+  if (_cacheTimer) return;
+  // refresh immediately, then every 2 seconds
+  _refreshCircuitCache();
+  _cacheTimer = setInterval(_refreshCircuitCache, 5000);
+}
+async function listCircuits(order){
+  const o = String(order || "desc").toLowerCase();
+  const base = Array.isArray(_cacheCircuits) ? _cacheCircuits.slice() : [];
+  if (o === "asc") return base;
+  return base.reverse();
+}
+
+function _normCC(x){ return String(x||"").trim().toUpperCase(); }
+
+function _exitOfCircuit(c){
+  try {
+    const hops = c?.hops || [];
+    const last = hops.length ? hops[hops.length-1] : null;
+    const cc = _normCC(last?.country_code || "");
+    return cc;
+  } catch { return ""; }
+}
+
+async function _waitForExitCircuit(wantArr, timeoutMs=12000){
+  // wantArr: [] => any exit acceptable (AUTO)
+  // wantArr: ["NL"] => must match
+  const want = Array.isArray(wantArr) ? wantArr.map(_normCC).filter(Boolean) : [];
+  const t0 = Date.now();
+
+  while ((Date.now() - t0) < timeoutMs){
+    // Force-refresh cache so /circuit answers match reality quickly
+    await _refreshCircuitCache();
+
+    const circs = await listCircuits("desc");
+    if (circs && circs.length){
+      if (!want.length) return true;
+      for (const c of circs){
+        const cc = _exitOfCircuit(c);
+        if (cc && want.includes(cc)) return true;
+      }
+    }
+    await new Promise(r => setTimeout(r, 350));
+  }
+  return false;
+}
+
+async function _waitForHopCircuit(wantHops, timeoutMs=12000){
+  // NOTE:
+  // Some Anyone-client builds still report 3 relays even when hopCount=2.
+  // For UI semantics we accept:
+  // - wantHops=2  => hoplen 2 OR 3
+  // - wantHops=3  => hoplen 3
+  const accept = (wantHops === 2) ? new Set([2,3]) : new Set([3]);
+  const t0 = Date.now();
+
+  while ((Date.now() - t0) < timeoutMs){
+    await _refreshCircuitCache();
+    const circs = await listCircuits("desc");
+    if (circs && circs.length){
+      for (const c of circs){
+        const hops = Array.isArray(c?.hops) ? c.hops.length : 0;
+        if (accept.has(hops)) return true;
+      }
+    }
+    await new Promise(r => setTimeout(r, 250));
+  }
+  return false;
+}
+
+
+
+
+function _pickCircuitForHopCount(circs, wantHopCount){
+  const want = (wantHopCount === 2) ? 2 : 3;
+  const arr = Array.isArray(circs) ? circs : [];
+  // prefer BUILT circuits with matching hop length
+  for (const c of arr){
+    const st = String(c?.status || "");
+    const hops = Array.isArray(c?.hops) ? c.hops : [];
+    if (st === "BUILT" && hops.length === want) return c;
+  }
+  // fallback: any BUILT circuit
+  for (const c of arr){
+    const st = String(c?.status || "");
+    if (st === "BUILT") return c;
+  }
+  // fallback: newest anything
+  return arr[0] || null;
+}
+
+async function _waitForBuiltHopCircuit(wantHopCount, timeoutMs=15000){
+  const t0 = Date.now();
+  while ((Date.now() - t0) < timeoutMs){
+    try{
+      const circs = await listCircuits("desc");
+      const picked = _pickCircuitForHopCount(circs, wantHopCount);
+      const hops = Array.isArray(picked?.hops) ? picked.hops : [];
+      if (picked && String(picked?.status||"") === "BUILT" && hops.length === ((wantHopCount===2)?2:3)) return true;
+    } catch {}
+    await new Promise(r => setTimeout(r, 250));
+  }
+  return false;
+}
+
+async function currentCircuit(){
+  // Primary: cache-backed list
+  let circs = await listCircuits("desc");
+
+  // If cache is empty, force-refresh once and fallback to live circuitStatus
+  if (!circs.length){
+    try { await _refreshCircuitCache(); } catch {}
+    circs = await listCircuits("desc");
+  }
+  if (!circs.length){
+    circs = await _liveBuiltGeneralCircuits();
+  }
+  if (!circs.length) return [];
+
+  // Hopmode-consistent selection:
+  // - 2-hop: accept 2 OR 3 relays (some anyone-client builds still report 3)
+  // - 3-hop: accept 3 relays only
+  const acceptLens = (hopCount === 2) ? new Set([2,3]) : new Set([3]);
+
+  const want = _effectiveExitCountries(); // []=AUTO, ["NL"]=restrict
+  const wantArr = Array.isArray(want) ? want.map(_normCC).filter(Boolean) : [];
+
+  const isBuilt = (c) => String(c?.status || "").startsWith("BUILT");
+  const hopLen = (c) => Array.isArray(c?.hops) ? c.hops.length : 0;
+
+  // 1) If exit restricted: pick newest BUILT circuit with acceptable hoplen AND matching exit
+  if (wantArr.length){
+    for (const c of circs){
+      if (!isBuilt(c)) continue;
+      if (!acceptLens.has(hopLen(c))) continue;
+      const cc = _exitOfCircuit(c);
+      if (cc && wantArr.includes(cc)) return c.hops || [];
+    }
+  }
+
+  // 2) Otherwise: pick newest BUILT circuit with acceptable hoplen
+  for (const c of circs){
+    if (!isBuilt(c)) continue;
+    if (!acceptLens.has(hopLen(c))) continue;
+    return c.hops || [];
+  }
+
+  // 3) Fallback: whatever we have (keeps UI alive even during rebuild)
+  for (const c of circs){
+    if (isBuilt(c)) return c.hops || [];
+  }
+  return (circs[0]?.hops || []);
+}
+
+// ----------------- HTTP API -----------------
+// ---- Non-blocking rebuild queue (prevents UI timeouts) ----
+let _rebuildInFlight = null;
+let _pendingRebuild = null;
+
+// Schedule a rebuild; coalesces rapid toggles (2->3->2) into the latest request.
+function _scheduleRebuild(nextHopCount){
+  const hc = ([2,3].includes(nextHopCount)) ? nextHopCount : 3;
+  _pendingRebuild = { hopCount: hc, ts: Date.now() };
+
+  if (_rebuildInFlight) return;
+
+  _rebuildInFlight = (async () => {
+    while (_pendingRebuild){
+      const job = _pendingRebuild;
+      _pendingRebuild = null;
+      try{
+        await rebuildVPNManager(job.hopCount);
+      } catch (e){
+        console.error("Rebuild failed:", e);
+      }
+    }
+    _rebuildInFlight = null;
+  })();
+}
+
+const app = express();
+app.use(express.json());
+
+app.get("/health", (req,res) => res.json({ ok:true }));
+
+app.get("/status", async (req,res) => {
+  let relayStats = null;
+  try {
+    relayStats = {
+      relays: stateManager?.getRelays?.()?.length ?? null,
+      guards: stateManager?.getGuards?.()?.length ?? null,
+      countries: stateManager?.getAvailableCountries?.()?.length ?? null
+    };
+  } catch {}
+
+  res.json({
+    ok: true,
+    hopCount,
+    exitCountries: _effectiveExitCountries(),
+    targets: buildTargets(hopCount).map(t => ({
+      address: t.address,
+      exitCountries: _effectiveExitCountries(),
+      hopCount: t.hopCount,
+      minCircuits: t.minCircuits,
+      maxCircuits: t.maxCircuits
+    })),
+    relayStats
+  });
+});
+
+// Set exit country/countries for circuit building (manager-local)
+// Body: { exitCountry: "DE" } OR { exitCountries: ["DE","NL"] } OR { exitCountry: "AUTO" }
+// Set exit country/countries for circuit building (manager-local)
+// Body: { exitCountry: "DE" } OR { exitCountries: ["DE","NL"] } OR { exitCountry: "AUTO" }
+app.post("/exit", async (req,res) => {
+  try {
+    let arr = req.body?.exitCountries;
+    const one = req.body?.exitCountry;
+
+    if (!arr && typeof one === "string") {
+      if (one.trim().toUpperCase() === "AUTO") arr = [];
+      else arr = [one];
+    }
+
+    if (!Array.isArray(arr)) arr = (CURRENT_EXIT_COUNTRIES === null) ? DEFAULT_EXIT_COUNTRIES : CURRENT_EXIT_COUNTRIES;
+
+    arr = arr.map(x => String(x || "").trim().toUpperCase()).filter(Boolean);
+
+    // [] means: no restriction / best available
+    CURRENT_EXIT_COUNTRIES = arr.length ? arr : [];
+
+    // Non-blocking: rebuild in background (prevents portal timeouts)
+    _scheduleRebuild(hopCount);
+
+    res.json({ ok:true, exitCountries: _effectiveExitCountries(), hopCount, scheduled:true });
+  } catch (e) {
+    res.status(400).json({ ok:false, error: String(e?.message || e) });
+  }
+});
+
+app.get("/hopmode", (req,res) => res.json({ hopCount }));
+
+app.post("/hopmode", async (req,res) => {
+  try {
+    const hc = parseInt((req.body?.hops ?? req.body?.hopCount), 10);
+    // Make the new hopCount visible immediately in /status for the UI
+    hopCount = ([2,3].includes(hc)) ? hc : 3;
+
+    // Non-blocking: rebuild in background (prevents portal timeouts)
+    _scheduleRebuild(hopCount);
+
+    res.json({ ok:true, hopCount, scheduled:true });
+  } catch (e) {
+    res.status(400).json({ ok:false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/newnym", async (req,res) => {
+  try { await control.msgAsync("SIGNAL NEWNYM"); res.json({ ok:true }); }
+  catch(e){ res.status(500).json({ ok:false, error: String(e?.message || e) }); }
+});
+
+app.get("/circuit", async (req,res) => {
+  try {
+    // Best-effort: keep cache warm for UI refreshes
+    try { _refreshCircuitCache(); } catch {}
+    res.json({ hops: await currentCircuit() });
+  }
+  catch(e){ res.status(500).json({ hops: [], error: String(e?.message || e) }); }
+});
+
+app.get("/circuits", async (req,res) => {
+  try {
+    const order = String(req.query.order || "desc").toLowerCase();
+    res.json({ circuits: await listCircuits(order), order });
+  } catch(e) {
+    res.status(500).json({ circuits: [], error: String(e?.message || e) });
+  }
+});
+
+// Boot
+(async () => {
+  await initManagers();
+  app.listen(PORT, HOST, () => {
+    console.log(`circuit-manager listening on http://${HOST}:${PORT} (hopCount=${hopCount})`);
+  });
+})().catch((e) => {
+  console.error("Manager failed:", e);
+  process.exit(1);
+});
