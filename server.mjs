@@ -505,17 +505,18 @@ let _cacheTs = 0;
 let _cacheTimer = null;
 let _circuitFirstSeen = new Map();  // Track when circuits were first seen
 let _rebuilding = false;
-let _pendingRebuild = null;  // queued rebuild reason when one is already running
+let _pendingRebuild = null;  // queued rebuild reason
 let _bootstrapping = false;
 
 // Rotation
 let rotation = {
-  enabled: true,
+  enabled: false,
   intervalSeconds: 600,
   variancePercent: 20,
 };
 let _rotationTimer = null;
-  rotation.nextRotationTs = 0;
+let _rotationNextTs = 0;      // unix timestamp (seconds) when next rotation fires
+let _rotationLastTs = 0;      // unix timestamp (seconds) of last rotation
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -1262,11 +1263,12 @@ function _ensureRotationTimer() {
   const variance = Math.max(0, Math.min(80, Number(rotation.variancePercent || 20))) / 100;
 
   const scheduleOnce = () => {
-    if (!rotation.enabled) return;
+    if (!rotation.enabled) { _rotationNextTs = 0; return; }
     const jitter = baseMs * variance;
     const nextMs = Math.max(30000, Math.round(baseMs + (Math.random() * 2 - 1) * jitter));
-    rotation.nextRotationTs = Math.floor(Date.now() / 1000 + nextMs / 1000);
+    _rotationNextTs = Math.floor(Date.now() / 1000) + Math.round(nextMs / 1000);
     _rotationTimer = setTimeout(async () => {
+      _rotationLastTs = Math.floor(Date.now() / 1000);
       try { await rebuildVPNManager("rotation"); } catch {}
       scheduleOnce();
     }, nextMs);
@@ -1279,16 +1281,16 @@ function _stopRotationTimer() {
   if (_rotationTimer) {
     clearTimeout(_rotationTimer);
     _rotationTimer = null;
-  rotation.nextRotationTs = 0;
   }
+  _rotationNextTs = 0;
 }
 
 async function rebuildVPNManager(reason = "manual") {
   console.error("[rebuildVPNManager] ENTER reason=" + reason + " _rebuilding=" + _rebuilding + " READY=" + READY);
   if (_rebuilding) {
-    console.error("[rebuildVPNManager] QUEUED: rebuild already in progress, will re-run for reason=" + reason);
     _pendingRebuild = reason;
-    return { ok: false, error: "rebuild_in_progress", queued: true };
+    console.error("[rebuildVPNManager] QUEUED reason=" + reason);
+    return { ok: true, queued: true, reason };
   }
   if (!READY || !control || !stateManager) {
     console.error("[rebuildVPNManager] BLOCKED: not ready (READY=" + READY + " control=" + !!control + " stateManager=" + !!stateManager + ")");
@@ -1340,8 +1342,6 @@ async function rebuildVPNManager(reason = "manual") {
   } finally {
     _rebuilding = false;
     console.error("[rebuildVPNManager] EXIT reason=" + reason);
-
-    // If another rebuild was requested while we were busy, run it now
     if (_pendingRebuild) {
       const nextReason = _pendingRebuild;
       _pendingRebuild = null;
@@ -1640,11 +1640,13 @@ app.post("/exit", async (req, res) => {
   // Validate against available exit countries (best-effort)
   const avail = _availableExitCountriesLower();
   if (desired.length && avail.length && !avail.includes(desired[0])) {
-    CURRENT_EXIT_COUNTRIES = []; // fallback to AUTO
-    const r0 = await rebuildVPNManager("exit_invalid_fallback");
+    // Land trotzdem setzen — Relays koennen spaeter verfuegbar werden
+    console.error("[/exit] WARNING: " + cc + " not in relay list, setting anyway");
+    CURRENT_EXIT_COUNTRIES = desired;
+    const r0 = await rebuildVPNManager("exit");
     return res.json({
       ok: true,
-      warning: `Exit ${cc} not available right now; falling back to AUTO`,
+      warning: `Exit ${cc} may have limited relays right now`,
       exitCountries: effectiveExitCountriesForStatus(),
       rebuild: r0
     });
@@ -1674,15 +1676,13 @@ app.post("/exit", async (req, res) => {
     }
   }
 
-  // If a specific cc was requested but no circuits exist, auto-fallback so UI never gets stuck on "building"
+  // Exit Country bleibt gesetzt auch wenn Circuits noch nicht fertig sind
   if (desired.length && _cacheCircuits.length === 0) {
-    CURRENT_EXIT_COUNTRIES = []; // AUTO
-    const r2 = await rebuildVPNManager("exit_timeout_fallback");
+    console.error("[/exit] No circuits yet for " + cc + " — keeping setting, will retry");
     return res.json({
       ok: true,
-      warning: `No circuits could be built for ${cc}; falling back to AUTO`,
-      exitCountries: effectiveExitCountriesForStatus(),
-      rebuild: r2
+      warning: `Circuits for ${cc} still building — exit country is set`,
+      exitCountries: effectiveExitCountriesForStatus()
     });
   }
 
@@ -1707,8 +1707,22 @@ app.get("/rotation", (_req, res) => {
     enabled: !!rotation.enabled,
     intervalSeconds: Number(rotation.intervalSeconds || 600),
     variancePercent: Number(rotation.variancePercent || 20),
-    nextRotationTs: rotation.nextRotationTs || 0, // keep the original object too
+    nextRotationTs: _rotationNextTs || 0,
+    lastRotationTs: _rotationLastTs || 0,
+    privacy: false,
     rotation
+  });
+});
+
+app.get("/rotation", (_req, res) => {
+  res.json({
+    ok: true,
+    enabled: rotation.enabled,
+    intervalSeconds: rotation.intervalSeconds,
+    variancePercent: rotation.variancePercent,
+    nextRotationTs: _rotationNextTs || 0,
+    lastRotationTs: _rotationLastTs || 0,
+    privacy: _privacyModeActive(),
   });
 });
 
@@ -1720,10 +1734,11 @@ app.post("/rotation", (req, res) => {
   const variancePercent = Math.max(0, Math.min(80, Number(src.variancePercent || 20)));
 
   rotation = { enabled, intervalSeconds, variancePercent };
+  _stopRotationTimer();
   if (rotation.enabled) _ensureRotationTimer();
   else _stopRotationTimer();
 
-  res.json({ ok: true, enabled, intervalSeconds, variancePercent, nextRotationTs: rotation.nextRotationTs || 0, rotation });
+  res.json({ ok: true, enabled, intervalSeconds, variancePercent, rotation });
 });
 
 app.post("/rotation/trigger", async (_req, res) => {

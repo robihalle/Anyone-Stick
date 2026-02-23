@@ -487,30 +487,81 @@ HTML = r"""
     </div>
   </div>
 
-  <div class="card">
-    <h3>Circuit Rotation (Privacy Only)</h3>
-    <div class="row">
-      <div class="muted" id="rot-privacy">Checking privacy…</div>
-      <button class="btn-secondary" style="width:auto" id="rot-toggle">Loading…</button>
+  <div class="card" id="rot-card">
+    <h3>Circuit Rotation</h3>
+
+    <!-- Status Banner -->
+    <div id="rot-status-banner" style="
+      padding:10px 14px; border-radius:8px; margin-bottom:12px;
+      font-weight:700; font-size:13px; text-align:center;
+      transition: background .3s, color .3s;
+      background:#2a2a2e; color:#888;
+    ">
+      <span id="rot-status-icon">⏳</span>
+      <span id="rot-status-text">Loading…</span>
     </div>
 
-    <div style="margin-top:10px">
-      <div class="muted">Interval (seconds)</div>
-      <input type="number" id="rot-interval" min="60" value="600">
+    <!-- Privacy hint -->
+    <div class="muted" id="rot-privacy" style="font-size:11px; margin-bottom:8px;">Checking privacy…</div>
+
+    <!-- Toggle ON/OFF -->
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+      <button id="rot-toggle" style="
+        min-width:130px; height:38px; border:none; border-radius:8px;
+        font-weight:700; font-size:13px; cursor:pointer;
+        transition: background .25s, transform .1s;
+      " class="btn-secondary">Loading…</button>
+      <span class="muted" id="rot-toggle-hint" style="font-size:11px;"></span>
     </div>
 
-    <div style="margin-top:10px">
-      <div class="muted">Variance (%)</div>
-      <input type="number" id="rot-variance" min="0" max="80" value="20">
+    <!-- Countdown (big & visible when active) -->
+    <div id="rot-countdown-box" style="
+      display:none; padding:12px; border-radius:8px;
+      background:rgba(46,204,113,.08); border:1px solid rgba(46,204,113,.25);
+      text-align:center; margin-bottom:12px;
+    ">
+      <div style="font-size:11px; color:#888; margin-bottom:4px;">Next rotation in</div>
+      <div id="rot-countdown" class="mono" style="font-size:28px; font-weight:900; color:#2ecc71;">—</div>
     </div>
 
-    <button class="btn-primary" style="margin-top:10px" id="rot-save">Save</button>
-    <button class="btn-secondary" style="margin-top:8px" id="rot-trigger">Rotate Now</button>
-    <div id="rot-status" class="muted" style="margin-top:8px;font-weight:800">&nbsp;</div>
-
-    <div class="muted" style="margin-top:10px">
-      Next rotation in: <span class="mono" id="rot-countdown">—</span>
+    <!-- Last rotation info -->
+    <div id="rot-last-info" style="display:none; font-size:11px; color:#888; margin-bottom:10px; text-align:center;">
+      Last rotation: <span id="rot-last-time" class="mono">—</span>
     </div>
+
+    <!-- Config fields -->
+    <div id="rot-config-section" style="
+      padding:10px; border-radius:8px; background:rgba(255,255,255,.03);
+      border:1px solid rgba(255,255,255,.06); margin-bottom:10px;
+    ">
+      <div style="display:flex; gap:10px;">
+        <div style="flex:1">
+          <div class="muted" style="font-size:11px; margin-bottom:3px;">Interval (sec)</div>
+          <input type="number" id="rot-interval" min="60" value="600" style="width:100%">
+        </div>
+        <div style="flex:1">
+          <div class="muted" style="font-size:11px; margin-bottom:3px;">Variance (%)</div>
+          <input type="number" id="rot-variance" min="0" max="80" value="20" style="width:100%">
+        </div>
+      </div>
+    </div>
+
+    <!-- Action buttons -->
+    <div style="display:flex; gap:8px;">
+      <button class="btn-primary" style="flex:1; position:relative;" id="rot-save">
+        <span id="rot-save-label">💾 Save</span>
+      </button>
+      <button class="btn-secondary" style="flex:1; position:relative;" id="rot-trigger">
+        <span id="rot-trigger-label">🔄 Rotate Now</span>
+      </button>
+    </div>
+
+    <!-- Feedback toast -->
+    <div id="rot-toast" style="
+      display:none; margin-top:8px; padding:8px 12px; border-radius:6px;
+      font-size:12px; font-weight:600; text-align:center;
+      transition: opacity .3s;
+    "></div>
   </div>
 
 
@@ -1178,20 +1229,19 @@ async function applyExit(){
   const btn = document.getElementById('exit-apply');
   btn.disabled = true; btn.textContent = '⏳ Applying…';
   try{
-    const resp = await jpost('/api/cm/exit', { exitCountry: cc }, 30000).catch(e=>({ok:false,error:String(e)}));
+    const resp = await jpost('/api/cm/exit', { exitCountry: cc }, 20000).catch(e=>({ok:false,error:String(e)}));
     if(!resp || !resp.ok){
-      // Don't show timeout or transient errors to the user —
-      // the switch continues in the background.
-      console.warn('Exit apply response:', resp);
+      const msg = (resp && resp.error) ? String(resp.error) : 'unknown error';
+      showJsError('Exit change failed: ' + msg);
+      // refresh UI from authoritative source
+      await initExitUi();
+      await refreshStatus();
+      return;
     }
 
     await refreshStatus();
     // wait for circuit to be BUILT (and optionally match exit)
-    btn.textContent = '⏳ Waiting for circuit…';
-    const matched = await waitForExit(cc, 30000);
-    if (!matched) {
-      console.warn('Exit wait: circuit did not match within timeout, continuing silently');
-    }
+    await waitForExit(cc, 20000);
     await refreshCircuit();
 
     // authoritative display
@@ -1273,6 +1323,7 @@ pollTraffic(); setInterval(pollTraffic, 5000);
 
 // ================= Rotation =================
 let __rotNextTs = 0;
+let __rotEnabled = false;
 
 function fmtCountdown(sec){
   sec = Math.max(0, Math.floor(sec||0));
@@ -1297,79 +1348,134 @@ async function refreshRotation(){
   document.getElementById('rot-variance').value = d.variancePercent || 20;
 
   __rotNextTs = d.nextRotationTs || 0;
+  __rotEnabled = d.enabled;
+  rotUpdateBanner();
 }
 
 function updateRotationCountdown(){
-  if(!__rotNextTs){
-    document.getElementById('rot-countdown').textContent = '—';
+  const cd = document.getElementById('rot-countdown');
+  const cbox = document.getElementById('rot-countdown-box');
+  if(!cd) return;
+
+  if(!__rotEnabled || !__rotNextTs){
+    cd.textContent = '—';
+    if(cbox) cbox.style.display = __rotEnabled ? 'block' : 'none';
     return;
   }
   const now = Math.floor(Date.now()/1000);
   const diff = __rotNextTs - now;
-  document.getElementById('rot-countdown').textContent =
-    diff > 0 ? fmtCountdown(diff) : 'due';
+  if(diff > 0){
+    cd.textContent = fmtCountdown(diff);
+    cd.style.color = '#2ecc71';
+  } else {
+    cd.textContent = 'rotating…';
+    cd.style.color = '#f1c40f';
+  }
+}
+
+function rotToast(msg, type){
+  const t = document.getElementById('rot-toast');
+  if(!t) return;
+  t.style.display = 'block';
+  t.textContent = msg;
+  t.style.background = type === 'ok' ? 'rgba(46,204,113,.15)' : type === 'err' ? 'rgba(231,76,60,.15)' : 'rgba(241,196,15,.15)';
+  t.style.color = type === 'ok' ? '#2ecc71' : type === 'err' ? '#e74c3c' : '#f1c40f';
+  clearTimeout(t._tid);
+  t._tid = setTimeout(()=>{ t.style.display='none'; }, 3500);
+}
+
+function rotUpdateBanner(){
+  const banner = document.getElementById('rot-status-banner');
+  const icon = document.getElementById('rot-status-icon');
+  const txt = document.getElementById('rot-status-text');
+  const cbox = document.getElementById('rot-countdown-box');
+  const hint = document.getElementById('rot-toggle-hint');
+  if(!banner) return;
+
+  if(__rotEnabled){
+    banner.style.background = 'rgba(46,204,113,.12)';
+    banner.style.color = '#2ecc71';
+    banner.style.border = '1px solid rgba(46,204,113,.3)';
+    icon.textContent = '🟢';
+    txt.textContent = 'Rotation ACTIVE';
+    if(cbox) cbox.style.display = 'block';
+    if(hint) hint.textContent = 'Click to stop rotation';
+  } else {
+    banner.style.background = 'rgba(255,255,255,.04)';
+    banner.style.color = '#888';
+    banner.style.border = '1px solid rgba(255,255,255,.08)';
+    icon.textContent = '⏸️';
+    txt.textContent = 'Rotation INACTIVE';
+    if(cbox) cbox.style.display = 'none';
+    if(hint) hint.textContent = 'Click to start rotation';
+  }
+}
+
+async function btnFeedback(btnId, labelId, action){
+  const btn = document.getElementById(btnId);
+  const lbl = document.getElementById(labelId);
+  if(!btn || !lbl) return;
+  const origTxt = lbl.textContent;
+  btn.disabled = true;
+  lbl.textContent = '⏳ Working…';
+  btn.style.opacity = '0.7';
+  try {
+    await action();
+    lbl.textContent = '✅ Done!';
+    btn.style.opacity = '1';
+    rotToast(btnId === 'rot-save' ? 'Settings saved' : 'Rotation triggered!', 'ok');
+    setTimeout(()=>{ lbl.textContent = origTxt; }, 1800);
+  } catch(e) {
+    lbl.textContent = '❌ Failed';
+    btn.style.opacity = '1';
+    rotToast('Error: ' + (e.message || String(e)), 'err');
+    setTimeout(()=>{ lbl.textContent = origTxt; }, 2500);
+  } finally {
+    btn.disabled = false;
+    await refreshRotation();
+  }
 }
 
 async function saveRotation(){
-  const btn = document.getElementById('rot-save');
-  const status = document.getElementById('rot-status');
-  const enabled = document.getElementById('rot-toggle').textContent === 'Enabled';
-  const interval = parseInt(document.getElementById('rot-interval').value) || 600;
-  const variance = parseInt(document.getElementById('rot-variance').value) || 20;
-  btn.disabled = true;
-  const oldText = btn.textContent;
-  btn.textContent = '⏳ Saving…';
-  if (status) status.textContent = '';
-  try {
+  await btnFeedback('rot-save', 'rot-save-label', async ()=>{
+    const interval = parseInt(document.getElementById('rot-interval').value) || 600;
+    const variance = parseInt(document.getElementById('rot-variance').value) || 20;
     await jpost('/api/cm/rotation', {
-      enabled,
+      enabled: __rotEnabled,
       intervalSeconds: interval,
       variancePercent: variance
-    }, 5000);
-    if (status) { status.textContent = '✔ Saved'; status.style.color = 'var(--secondary)'; }
-    await refreshRotation();
-  } catch(e) {
-    if (status) { status.textContent = '✘ Save failed'; status.style.color = '#ff8a84'; }
-  } finally {
-    btn.disabled = false;
-    btn.textContent = oldText;
-    if (status) setTimeout(() => { status.textContent = ' '; status.style.color = ''; }, 4000);
-  }
+    }, 4000);
+  });
 }
 
 async function toggleRotation(){
-  const d = await jget('/api/cm/rotation');
-  await jpost('/api/cm/rotation', {
-    enabled: !d.enabled,
-    intervalSeconds: d.intervalSeconds,
-    variancePercent: d.variancePercent
-  });
-  await refreshRotation();
+  const toggle = document.getElementById('rot-toggle');
+  toggle.disabled = true;
+  toggle.textContent = '⏳ …';
+  try {
+    const d = await jget('/api/cm/rotation');
+    const newEnabled = !d.enabled;
+    const interval = parseInt(document.getElementById('rot-interval').value) || d.intervalSeconds || 600;
+    const variance = parseInt(document.getElementById('rot-variance').value) || d.variancePercent || 20;
+    await jpost('/api/cm/rotation', {
+      enabled: newEnabled,
+      intervalSeconds: interval,
+      variancePercent: variance
+    });
+    rotToast(newEnabled ? 'Rotation enabled — timer started' : 'Rotation disabled — timer stopped', 'ok');
+  } catch(e) {
+    rotToast('Toggle failed: ' + (e.message||String(e)), 'err');
+  } finally {
+    toggle.disabled = false;
+    await refreshRotation();
+  }
 }
 
 async function triggerRotation(){
-  const btn = document.getElementById('rot-trigger');
-  const status = document.getElementById('rot-status');
-  btn.disabled = true;
-  const oldText = btn.textContent;
-  btn.textContent = '⏳ Rotating…';
-  if (status) status.textContent = '';
-  try {
-    const r = await jpost('/api/cm/rotation/trigger', {}, 12000).catch(e=>({ok:false}));
-    if (r && r.ok) {
-      if (status) { status.textContent = '✔ Rotation triggered'; status.style.color = 'var(--secondary)'; }
-      await refreshRotation();
-      await refreshCircuit();
-    } else {
-      if (status) { status.textContent = '✘ Rotation failed'; status.style.color = '#ff8a84'; }
-    }
-  } catch(e) {
-    if (status) { status.textContent = '✘ Rotation failed'; status.style.color = '#ff8a84'; }
-  } finally {
-    btn.disabled = false;
-    btn.textContent = oldText;
-    if (status) setTimeout(() => { status.textContent = ' '; status.style.color = ''; }, 5000);
-  }
+  await btnFeedback('rot-trigger', 'rot-trigger-label', async ()=>{
+    await jpost('/api/cm/rotation/trigger', {}, 8000);
+    await refreshCircuit();
+  });
 }
 
 safeBind('rot-toggle','click', toggleRotation);
