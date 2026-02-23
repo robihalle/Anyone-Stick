@@ -1328,7 +1328,13 @@ async function rebuildVPNManager(reason = "manual") {
       disablePredictedCircuits: true,
       disableConflux: true,
     });
-    await vpnManager.initialize();
+    await Promise.race([
+      vpnManager.initialize(),
+      new Promise(resolve => setTimeout(() => {
+        console.error("[vpnManager.initialize] timed out after 90s - continuing anyway");
+        resolve();
+      }, 90000))
+    ]);
 
     _refreshRelayIndex();
     await _refreshCircuitCache();
@@ -1384,7 +1390,13 @@ async function initManagersOnce() {
     disablePredictedCircuits: true,
     disableConflux: true,
   });
-  await vpnManager.initialize();
+  await Promise.race([
+    vpnManager.initialize(),
+    new Promise(resolve => setTimeout(() => {
+      console.error("[vpnManager.initialize] timed out after 90s - continuing anyway");
+      resolve();
+    }, 90000))
+  ]);
 
   _startCircuitCache();
   await _refreshCircuitCache();

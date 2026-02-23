@@ -1005,7 +1005,7 @@ async function refreshCircuit(){
   const now = Date.now();
   const switching = (typeof __uiSwitchingUntil === "number") && (Date.now() < __uiSwitchingUntil);
   const hc = Number(window.__hopCount || 3);
-  const wantLens = (hc === 2) ? new Set([2,3]) : new Set([3]);
+  const wantLens = (hc === 2) ? new Set([2,3,4,5,6]) : new Set([2,3,4,5,6]);
 
   // During hop switch: never show wrong-length circuit (prevents 3-hop flashing in 2-hop mode etc.)
   if (hops.length && !wantLens.has(hops.length)){
