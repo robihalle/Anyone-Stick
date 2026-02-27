@@ -162,7 +162,6 @@ fi
 id debian-anon &>/dev/null || error "debian-anon user missing — is the anon package installed correctly?"
 [[ -d /var/lib/anon ]] || error "/var/lib/anon missing — is the anon package installed correctly?"
 
-# Deploy anonrc
 # Deploy anonrc to the path used by start_anyone_stack.sh (-f /etc/anonrc)
 copy_file "anonrc" "/etc/anonrc" 644
 # Also place in /etc/anon/ for compatibility with anon package defaults
@@ -340,3 +339,4 @@ echo -e "${GREEN}║${NC}  After reboot, verify:                       ${GREEN}�
 echo -e "${GREEN}║${NC}  ${BLUE}sudo systemctl status anyone-stick${NC}          ${GREEN}║${NC}"
 echo -e "${GREEN}║${NC}  ${BLUE}curl http://192.168.7.1/api/anyone/proof${NC}     ${GREEN}║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
+
