@@ -228,15 +228,26 @@ copy_file "app.py" "$PORTAL_DIR/app.py" 644
 # Optional: deploy static folder if present in repo
 [[ -d "$SCRIPT_DIR/static" ]] && cp -r "$SCRIPT_DIR/static" "$PORTAL_DIR/"
 
-# Ensure static dir exists before deploying logo
+# Ensure static dir exists before deploying logo (optional — warn only if missing)
 mkdir -p "$PORTAL_DIR/static"
-copy_file "logo.png" "$PORTAL_DIR/static/logo.png" 644
+if [[ -f "$SCRIPT_DIR/logo.png" ]]; then
+  copy_file "logo.png" "$PORTAL_DIR/static/logo.png" 644
+elif curl -fsSL --head "$REPO_RAW/logo.png" &>/dev/null; then
+  copy_file "logo.png" "$PORTAL_DIR/static/logo.png" 644
+else
+  warn "logo.png not found in repo — skipping (portal will work without it)"
+fi
 
 python3 -m venv "$PORTAL_DIR/venv"
 "$PORTAL_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$PORTAL_DIR/venv/bin/pip" install --quiet \
   flask "gunicorn[gthread]" requests
 ok "Python dependencies installed"
+
+# Symlink venv's gunicorn into system PATH so start_anyone_stack.sh finds it
+# (start_anyone_stack.sh uses 'command -v gunicorn' which checks system PATH)
+ln -sf "$PORTAL_DIR/venv/bin/gunicorn" /usr/local/bin/gunicorn
+ok "gunicorn symlinked → /usr/local/bin/gunicorn"
 
 chown -R pi:pi "$PORTAL_DIR"
 
