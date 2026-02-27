@@ -48,7 +48,7 @@ else
 fi
 
 # 5. Connect Wi-Fi in background (non-blocking)
-nmcli con up "Stick-Gateway" 2>/dev/null &
+# WiFi already configured by Pi Imager — no manual nmcli con up needed
 
 # 6. Wait for Wi-Fi (max 30s)
 for i in $(seq 1 30); do

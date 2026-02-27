@@ -1,41 +1,17 @@
 [Unit]
 Description=Anyone Stick Circuit Manager (ControlPort owner)
-After=network.target
-Wants=network.target
+After=network.target anon.service
+Wants=network.target anon.service
 
-# Avoid infinite restart storms
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
 [Service]
 ExecStartPre=/usr/bin/mkdir -p /root/.anon-cache
 ExecStartPre=/usr/bin/chown -R root:root /root/.anon-cache
-Type=simple
-User=root
-WorkingDirectory=/opt/anyone-stick/circuit-manager
-
-# Make logs readable in journalctl
-Environment=NODE_ENV=production
-Environment=HOST=127.0.0.1
-Environment=PORT=8787
-
-# Hard preflight checks (fail fast with clear logs)
-ExecStartPre=/usr/bin/test -x /usr/bin/node
-ExecStartPre=/usr/bin/test -f /opt/anyone-stick/circuit-manager/server.mjs
-ExecStartPre=/usr/bin/test -r /var/lib/anon/control_auth_cookie
-ExecStartPre=/usr/bin/node --check /opt/anyone-stick/circuit-manager/server.mjs
-
 ExecStart=/usr/bin/node /opt/anyone-stick/circuit-manager/server.mjs
-
 Restart=on-failure
-RestartSec=2
-
-# Give it enough file descriptors; Pi sometimes tight
-LimitNOFILE=65535
-
-# Shutdown behavior
-KillSignal=SIGINT
-TimeoutStopSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
