@@ -163,8 +163,11 @@ id debian-anon &>/dev/null || error "debian-anon user missing — is the anon pa
 [[ -d /var/lib/anon ]] || error "/var/lib/anon missing — is the anon package installed correctly?"
 
 # Deploy anonrc
+# Deploy anonrc to the path used by start_anyone_stack.sh (-f /etc/anonrc)
+copy_file "anonrc" "/etc/anonrc" 644
+# Also place in /etc/anon/ for compatibility with anon package defaults
 mkdir -p /etc/anon
-copy_file "anonrc" "/etc/anon/anonrc" 644
+ln -sf /etc/anonrc /etc/anon/anonrc
 
 mkdir -p /var/log/anon
 chown debian-anon:debian-anon /var/log/anon
