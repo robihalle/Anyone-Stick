@@ -94,24 +94,41 @@ systemctl enable --now NetworkManager
 ok "NetworkManager active"
 
 # =============================================================================
-# 2 -- USB Gadget (dwc2 + configfs/NCM)
+# 2 — USB Gadget (dwc2 + configfs/NCM)
 # =============================================================================
-section "2/9 - USB Gadget"
+section "2/9 · USB Gadget"
 
 CONFIG_TXT="/boot/firmware/config.txt"
 [[ ! -f "$CONFIG_TXT" ]] && CONFIG_TXT="/boot/config.txt"  # fallback for older images
 
-# --- config.txt: dtoverlay=dwc2 ---
-if ! grep -q 'dtoverlay=dwc2' "$CONFIG_TXT"; then
-  echo '' >> "$CONFIG_TXT"
-  echo '# Anyone Stick -- USB Gadget' >> "$CONFIG_TXT"
-  echo 'dtoverlay=dwc2' >> "$CONFIG_TXT"
-  ok "dtoverlay=dwc2 appended to $CONFIG_TXT"
+# --- config.txt: dtoverlay=dwc2,dr_mode=peripheral ---
+# Do NOT overwrite the whole file — it contains board-specific settings.
+# We need dr_mode=peripheral to force gadget mode (not host mode).
+
+# Remove any bare "dtoverlay=dwc2" (without dr_mode) to avoid conflicts
+sed -i '/^dtoverlay=dwc2$/d' "$CONFIG_TXT"
+
+# Ensure [all] section has the correct overlay
+if ! grep -q 'dtoverlay=dwc2,dr_mode=peripheral' "$CONFIG_TXT"; then
+  if grep -q '^\[all\]' "$CONFIG_TXT"; then
+    sed -i '/^\[all\]/a dtoverlay=dwc2,dr_mode=peripheral' "$CONFIG_TXT"
+  else
+    cat >> "$CONFIG_TXT" << 'DTOVERLAY'
+
+# Anyone Stick — USB Gadget
+[all]
+enable_uart=1
+dtoverlay=dwc2,dr_mode=peripheral
+DTOVERLAY
+  fi
+  ok "dtoverlay=dwc2,dr_mode=peripheral added to [all] in $CONFIG_TXT"
 else
-  ok "dtoverlay=dwc2 already present"
+  ok "dtoverlay=dwc2,dr_mode=peripheral already present"
 fi
 
 # --- cmdline.txt: modules-load=dwc2 ---
+# IMPORTANT: cmdline.txt must remain a single line — never append a newline!
+# Do NOT replace this file: it contains the root PARTUUID which is unique per SD card.
 CMDLINE_TXT="/boot/firmware/cmdline.txt"
 [[ ! -f "$CMDLINE_TXT" ]] && CMDLINE_TXT="/boot/cmdline.txt"
 
