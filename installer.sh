@@ -77,9 +77,8 @@ apt-get install -y --no-install-recommends \
   git curl wget \
   python3 python3-pip python3-venv \
   network-manager dnsmasq \
-  iptables ip6tables iproute2 \
-  jq usbutils dnsutils \
-  libcomposite
+  iptables iproute2 \
+  jq usbutils dnsutils
 ok "Packages installed"
 
 # systemd-resolved conflicts with dnsmasq on port 53
@@ -103,7 +102,6 @@ CONFIG_TXT="/boot/firmware/config.txt"
 [[ ! -f "$CONFIG_TXT" ]] && CONFIG_TXT="/boot/config.txt"  # fallback for older images
 
 # --- config.txt: dtoverlay=dwc2 ---
-# Enables the OTG hardware port -- do NOT overwrite the file (it contains board-specific settings)
 if ! grep -q 'dtoverlay=dwc2' "$CONFIG_TXT"; then
   echo '' >> "$CONFIG_TXT"
   echo '# Anyone Stick -- USB Gadget' >> "$CONFIG_TXT"
@@ -114,13 +112,10 @@ else
 fi
 
 # --- cmdline.txt: modules-load=dwc2 ---
-# IMPORTANT: cmdline.txt must remain a single line -- never append a newline!
-# Do NOT replace this file: it contains the root PARTUUID which is unique per SD card.
 CMDLINE_TXT="/boot/firmware/cmdline.txt"
 [[ ! -f "$CMDLINE_TXT" ]] && CMDLINE_TXT="/boot/cmdline.txt"
 
 if ! grep -q 'modules-load=dwc2' "$CMDLINE_TXT"; then
-  # Insert before 'rootwait' if present, otherwise append at end of line
   if grep -q 'rootwait' "$CMDLINE_TXT"; then
     sed -i 's/rootwait/modules-load=dwc2 rootwait/' "$CMDLINE_TXT"
   else
@@ -131,7 +126,7 @@ else
   ok "modules-load=dwc2 already present"
 fi
 
-# Load libcomposite at boot (required for configfs USB gadget via usb_gadget_setup.sh)
+# Load libcomposite kernel module at boot (required for configfs USB gadget)
 if ! grep -q 'libcomposite' /etc/modules-load.d/*.conf 2>/dev/null; then
   echo 'libcomposite' > /etc/modules-load.d/usb-gadget.conf
   ok "libcomposite added to modules-load"
@@ -170,7 +165,7 @@ copy_file "anonrc" "/etc/anon/anonrc" 644
 mkdir -p /var/log/anon
 chown debian-anon:debian-anon /var/log/anon
 
-# Enable anon at boot -- required so control_auth_cookie exists when circuit-manager starts
+# Enable anon at boot
 systemctl enable anon
 ok "anon configuration complete"
 
@@ -207,7 +202,7 @@ log "Running npm install in circuit manager directory..."
 cd "$CM_DIR" && npm install --omit=dev 2>&1 | tail -5
 cd - > /dev/null
 
-# anon cache directory (used by ExecStartPre in service)
+# anon cache directory
 mkdir -p /root/.anon-cache
 
 # Syntax check
@@ -229,7 +224,6 @@ copy_file "app.py" "$PORTAL_DIR/app.py" 644
 # Optional: deploy static folder if present in repo
 [[ -d "$SCRIPT_DIR/static" ]] && cp -r "$SCRIPT_DIR/static" "$PORTAL_DIR/"
 
-# Ensure static dir exists before deploying logo (optional -- warn only if missing)
 mkdir -p "$PORTAL_DIR/static"
 if [[ -f "$SCRIPT_DIR/logo.png" ]]; then
   copy_file "logo.png" "$PORTAL_DIR/static/logo.png" 644
@@ -245,8 +239,6 @@ python3 -m venv "$PORTAL_DIR/venv"
   flask "gunicorn[gthread]" requests
 ok "Python dependencies installed"
 
-# Symlink venv's gunicorn into system PATH so start_anyone_stack.sh finds it
-# (start_anyone_stack.sh uses 'command -v gunicorn' which checks system PATH)
 ln -sf "$PORTAL_DIR/venv/bin/gunicorn" /usr/local/bin/gunicorn
 ok "gunicorn symlinked -> /usr/local/bin/gunicorn"
 
@@ -266,7 +258,6 @@ do
   copy_file "$script" "$BIN_DIR/$script" 755
 done
 
-# State directory for privacy marker, killswitch flag etc.
 mkdir -p "$STATE_DIR"
 ok "State directory: $STATE_DIR"
 
@@ -275,7 +266,6 @@ ok "State directory: $STATE_DIR"
 # =============================================================================
 section "7/9 - dnsmasq (DHCP for USB client)"
 
-# Enable conf-dir inclusion in main config to avoid conflicts
 if [[ -f /etc/dnsmasq.conf ]]; then
   sed -i 's/^#conf-dir/conf-dir/' /etc/dnsmasq.conf 2>/dev/null || true
 fi
@@ -289,7 +279,6 @@ dhcp-option=6,192.168.7.1
 log-queries
 DNSMASQ
 
-# dnsmasq is managed by start_anyone_stack.sh -- do not autostart
 systemctl disable dnsmasq 2>/dev/null || true
 ok "dnsmasq configured (started manually by stack script)"
 
