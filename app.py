@@ -136,6 +136,44 @@ stats = {"rx": 0, "tx": 0, "time": 0, "speed_rx": 0, "speed_tx": 0}
 _traffic_offset = {"rx": 0, "tx": 0}
 _traffic_raw_prev = {"rx": 0, "tx": 0, "time": 0.0}
 
+
+def _wait_for_circuit_ready(timeout=30, poll_interval=1.0):
+    """
+    Poll the circuit-manager /wait-ready endpoint (or fallback to /status)
+    until at least one circuit is BUILT, or timeout.
+    Returns True if ready, False if timed out.
+    """
+    import urllib.request, json as _json
+    base = CIRCUIT_MGR_BASE
+
+    # Try the dedicated /wait-ready endpoint first
+    try:
+        url = f"{base}/wait-ready?timeout={int(timeout * 1000)}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+            return bool(data.get("ready", False))
+    except Exception:
+        pass
+
+    # Fallback: poll /status ourselves
+    import time as _time
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base}/status", timeout=3) as resp:
+                data = _json.loads(resp.read().decode("utf-8", "replace"))
+                circuits = data.get("circuits", [])
+                if isinstance(circuits, list) and len(circuits) > 0:
+                    return True
+                # Also check if bootstrapped
+                if data.get("bootstrapped") or data.get("connected"):
+                    return True
+        except Exception:
+            pass
+        _time.sleep(poll_interval)
+    return False
+
 def update_stats():
     global stats, _traffic_offset, _traffic_raw_prev
     try:
@@ -263,7 +301,7 @@ def _anyone_proof_check():
             connected = True
             reason = "socks_ok_checkpage"
 
-        m = re.search(r"ip address appears to be:\s*([0-9a-fA-F\.:]+)", body, re.I)
+        m = re.search(r"ip address appears to be:[\s<>/a-zA-Z]*?([0-9a-fA-F\.:]+)", body, re.I)
         if m:
             ip = m.group(1).strip()
     else:
@@ -281,6 +319,21 @@ def _anyone_proof_check():
                 break
             if rc2 != 0 and reason.startswith("curl_rc_"):
                 reason = f"curl_rc_{rc2}"
+
+    # 3) Final fallback: use exit node IP from circuit-manager (no external call needed)
+    if not ip:
+        try:
+            import requests as _rq
+            cr = _rq.get("http://127.0.0.1:8787/circuit", timeout=3).json()
+            hops = cr.get("hops") or []
+            exit_hop = next((h for h in hops if (h.get("role") or "").lower() == "exit"), None)
+            if exit_hop and exit_hop.get("ip"):
+                ip = exit_hop["ip"]
+                if not connected:
+                    connected = True
+                    reason = "cm_exit_ip"
+        except Exception:
+            pass
 
     _anyone_cache.update({"ts": now, "connected": bool(connected), "ip": ip, "reason": reason})
     return _anyone_cache
@@ -362,6 +415,15 @@ HTML = r"""
   }
   .proof-banner.disconnected { background: rgba(248,81,73,0.18); color: #ff8a84; }
   .proof-banner.connected { background: rgba(63,185,80,0.18); color: #7ee787; }
+.proof-banner.connecting {
+  background: linear-gradient(90deg, #ff9800 0%, #ffc107 100%);
+  color: #fff;
+  animation: pulse-connecting 1.5s ease-in-out infinite;
+}
+@keyframes pulse-connecting {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
   .proof-sub { display:block; margin-top: 4px; font-size: 11px; font-weight: 800; opacity: 0.95; text-transform: none; letter-spacing: 0; }
 
   .wifi-item { padding:12px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; justify-content:space-between; font-size:14px; }
@@ -613,30 +675,8 @@ HTML = r"""
     <h3>Exit Country</h3>
     <div class="muted">This now configures the Node circuit-manager (authoritative). Anonrc can optionally mirror it.</div>
     <select id="exit-select">
-      <option value="AUTO">🌍 Automatic (Best Available)</option>
-      <option value="DE">🇩🇪 Germany</option>
-      <option value="NL">🇳🇱 Netherlands</option>
-      <option value="US">🇺🇸 United States</option>
-      <option value="FR">🇫🇷 France</option>
-      <option value="GB">🇬🇧 United Kingdom</option>
-      <option value="ES">🇪🇸 Spain</option>
-      <option value="IT">🇮🇹 Italy</option>
-      <option value="PL">🇵🇱 Poland</option>
-      <option value="SE">🇸🇪 Sweden</option>
-      <option value="NO">🇳🇴 Norway</option>
-      <option value="FI">🇫🇮 Finland</option>
-      <option value="CH">🇨🇭 Switzerland</option>
-      <option value="AT">🇦🇹 Austria</option>
-      <option value="CZ">🇨🇿 Czech Republic</option>
-      <option value="RO">🇷🇴 Romania</option>
-      <option value="BG">🇧🇬 Bulgaria</option>
-      <option value="HU">🇭🇺 Hungary</option>
-      <option value="PT">🇵🇹 Portugal</option>
-      <option value="CA">🇨🇦 Canada</option>
-      <option value="AU">🇦🇺 Australia</option>
-      <option value="JP">🇯🇵 Japan</option>
-      <option value="SG">🇸🇬 Singapore</option>
-    </select>
+            <option value="AUTO">&#127758; Automatic (Best Available)</option>
+          </select>
     <button class="btn-secondary" style="margin-top:10px" id="exit-apply">Apply Exit Country</button>
     <div class="muted" style="margin-top:8px">Configured (manager): <span class="mono" id="exit-current">{{ exit_country }}</span></div>
   </div>
@@ -1005,7 +1045,7 @@ async function refreshCircuit(){
   const now = Date.now();
   const switching = (typeof __uiSwitchingUntil === "number") && (Date.now() < __uiSwitchingUntil);
   const hc = Number(window.__hopCount || 3);
-  const wantLens = (hc === 2) ? new Set([2,3,4,5,6]) : new Set([2,3,4,5,6]);
+  const wantLens = (hc === 2) ? new Set([2,3]) : new Set([3]);
 
   // During hop switch: never show wrong-length circuit (prevents 3-hop flashing in 2-hop mode etc.)
   if (hops.length && !wantLens.has(hops.length)){
@@ -1015,7 +1055,7 @@ async function refreshCircuit(){
 
   // Empty -> placeholders; keep last-good only when NOT switching
   if (!hops.length){
-    if (!switching && window.__lastGoodHops.length && (now - window.__lastGoodTs) < 12000){
+    if (!switching && window.__lastGoodHops.length && (now - window.__lastGoodTs) < 15000){
       return; // keep last good (avoid flicker)
     }
     renderCircuit([]); // placeholders
@@ -1113,17 +1153,34 @@ async function newnym(){
 }
 
 async function updateProof(){
-  const st = await jget('/api/anyone/proof', 18000).catch(()=>({connected:false, ip:'', privacy:false}));
-  const b = document.getElementById('proof-banner');
-  const sub = document.getElementById('proof-sub');
-  const connected = !!(st && st.display_connected);
-  b.className = 'proof-banner ' + (connected ? 'connected' : 'disconnected');
-  const main = document.getElementById('proof-main');
-  if (main) main.textContent = connected ? 'Connected to Anyone' : 'Not connected to Anyone';
-  let msg = '';
-  if (!st.privacy) msg += 'Privacy mode is OFF. ';
-  if (st.privacy && st.ip) msg += 'Exit IP: ' + st.ip + '.';
-  sub.textContent = msg.trim() || '—';
+  jget('/api/anyone/proof', 18000).then(function(st){
+    if (!st) st = {connected:false, ip:'', privacy:false, connection_state:'disconnected'};
+    var b = document.getElementById('proof-banner');
+    var sub = document.getElementById('proof-sub');
+    var main = document.getElementById('proof-main');
+    var connState = st.connection_state || (st.display_connected ? 'connected' : 'disconnected');
+
+    if (connState === 'connected') {
+      if (b) b.className = 'proof-banner connected';
+      if (main) main.textContent = 'Connected to Anyone';
+    } else if (connState === 'connecting') {
+      if (b) b.className = 'proof-banner connecting';
+      if (main) main.textContent = 'Connecting to Anyone\u2026';
+    } else if (connState === 'off') {
+      if (b) b.className = 'proof-banner disconnected';
+      if (main) main.textContent = 'Privacy Mode is OFF';
+    } else {
+      if (b) b.className = 'proof-banner disconnected';
+      if (main) main.textContent = 'Not connected to Anyone';
+    }
+    var msg = '';
+    if (!st.privacy) msg += 'Privacy mode is OFF. ';
+    if (st.privacy && st.ip) msg += 'Exit IP: ' + st.ip + '. ';
+    if (sub) sub.textContent = msg.trim() || '\u2014';
+  }).catch(function(){
+    var main = document.getElementById('proof-main');
+    if (main) main.textContent = 'Checking connection\u2026';
+  });
 }
 
 async function pollTraffic(){
@@ -1254,13 +1311,57 @@ async function applyExit(){
 
 
 async function initExitUi(){
+  const COUNTRY_NAMES = {
+    AUTO:'Automatic (Best Available)',
+    DE:'Germany', NL:'Netherlands', US:'United States', FR:'France',
+    GB:'United Kingdom', ES:'Spain', IT:'Italy', PL:'Poland', SE:'Sweden',
+    NO:'Norway', FI:'Finland', CH:'Switzerland', AT:'Austria', CZ:'Czech Republic',
+    RO:'Romania', BG:'Bulgaria', HU:'Hungary', PT:'Portugal', CA:'Canada',
+    AU:'Australia', JP:'Japan', SG:'Singapore', BR:'Brazil', IN:'India',
+    ZA:'South Africa', MX:'Mexico', AR:'Argentina', KR:'South Korea',
+    TW:'Taiwan', UA:'Ukraine', TR:'Turkey', RS:'Serbia', HR:'Croatia',
+    SK:'Slovakia', SI:'Slovenia', LT:'Lithuania', LV:'Latvia', EE:'Estonia',
+    LU:'Luxembourg', BE:'Belgium', DK:'Denmark', GR:'Greece', IE:'Ireland',
+    IS:'Iceland', NZ:'New Zealand', CL:'Chile', CO:'Colombia', PE:'Peru',
+    IL:'Israel', SA:'Saudi Arabia', AE:'UAE', TH:'Thailand', ID:'Indonesia',
+    MY:'Malaysia', PH:'Philippines', VN:'Vietnam', NG:'Nigeria', KE:'Kenya',
+  };
   try{
     const cur = await jget('/api/exit/current', 2000).catch(()=>({exit_country:'AUTO'}));
-    const cc = String(cur.exit_country || 'AUTO').toUpperCase();
-    const sel = document.getElementById('exit-select');
+    const currentCC = String(cur.exit_country || 'AUTO').toUpperCase();
     const curEl = document.getElementById('exit-current');
-    if (sel) sel.value = cc;
-    if (curEl) curEl.textContent = cc;
+    if (curEl) curEl.textContent = currentCC;
+
+    const avail = await jget('/api/cm/available-exits', 3000).catch(()=>null);
+    const sel = document.getElementById('exit-select');
+    if (!sel) return;
+
+    let codes = ['AUTO'];
+    if (avail && Array.isArray(avail.countries) && avail.countries.length){
+      codes = ['AUTO', ...avail.countries.map(c => String(c).toUpperCase())];
+    }
+
+    sel.innerHTML = '';
+    codes.forEach(cc => {
+      const opt = document.createElement('option');
+      opt.value = cc;
+      const name = COUNTRY_NAMES[cc] || cc;
+      opt.textContent = (cc === 'AUTO' ? '🌎 ' : flag(cc) + ' ') + name;
+      sel.appendChild(opt);
+    });
+
+    if (codes.includes(currentCC)){
+      sel.value = currentCC;
+    } else if (currentCC !== 'AUTO'){
+      const opt = document.createElement('option');
+      opt.value = currentCC;
+      opt.textContent = flag(currentCC) + ' ' + (COUNTRY_NAMES[currentCC] || currentCC) + ' (unavailable)';
+      opt.disabled = true;
+      sel.insertBefore(opt, sel.children[1] || null);
+      sel.value = currentCC;
+    } else {
+      sel.value = 'AUTO';
+    }
   }catch(e){}
 }
 
@@ -1316,6 +1417,7 @@ async function pollModeSwitch(){
 // Kick off early on load
 pollModeSwitch().catch(()=>{});
 refreshKillSwitch(); setInterval(refreshKillSwitch, 4000);
+initExitUi();
 refreshStatus(); setInterval(refreshStatus, 4000);
 refreshCircuit(); setInterval(refreshCircuit, 4000);
 updateProof(); setInterval(updateProof, 7000);
@@ -1527,6 +1629,17 @@ def api_cm_hopmode():
 def api_cm_newnym():
     return jsonify(_cm_request("/newnym", "POST", {}, timeout=6.0))
 
+
+@app.get("/api/cm/available-exits")
+def api_cm_available_exits():
+    """Proxy to circuit-manager /available-exits"""
+    import requests as _req
+    try:
+        r = _req.get(f"{CIRCUIT_MGR_BASE}/available-exits", timeout=5)
+        return (r.content, r.status_code, {"Content-Type": "application/json"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
 @app.post("/api/cm/exit")
 def api_cm_exit():
     d = request.get_json(silent=True) or {}
@@ -1604,16 +1717,44 @@ def api_traffic_reset():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.get("/api/anyone/proof")
 def api_anyone_proof():
     st = _anyone_proof_check()
     privacy = _privacy_mode_active()
+
+    # Enrich with circuit-manager data
+    cm = _cm_status_cached(max_age=5.0)
+    cm_ok = isinstance(cm, dict) and cm.get("ok", False)
+    bootstrapping = bool(cm.get("bootstrapping")) if cm_ok else False
+    circuit_count = int(cm.get("circuitsCached", 0)) if cm_ok else 0
+    country = cm.get("observed", {}).get("exitCountry") if cm_ok else None
+
+    socks_connected = bool(st.get("connected"))
+
+    # Determine connection_state based on ACTUAL connectivity, not just privacy mode
+    if not privacy:
+        connection_state = "off"
+    elif socks_connected and cm_ok and circuit_count > 0 and not bootstrapping:
+        connection_state = "connected"
+    elif cm_ok and bootstrapping:
+        connection_state = "connecting"
+    elif cm_ok and circuit_count == 0:
+        connection_state = "connecting"
+    else:
+        connection_state = "disconnected"
+
     st2 = dict(st)
-    st2.update({"privacy": bool(privacy)})
-    st2["display_connected"] = bool(st2.get("connected")) and bool(privacy)
+    st2.update({
+        "privacy": bool(privacy),
+        "cm_ok": cm_ok,
+        "circuit_count": circuit_count,
+        "country": country,
+        "connection_state": connection_state,
+        "display_connected": bool(privacy) and socks_connected and cm_ok and circuit_count > 0,
+    })
     return jsonify(st2), 200
 
-# ---- Exit country (local display) ----
 @app.get("/api/exit/current")
 def api_exit_current():
     return jsonify({"exit_country": _exit_country_from_manager(), "source": "manager"}), 200
@@ -1684,12 +1825,15 @@ def api_mode_get():
 
 @app.post("/api/mode/privacy")
 def api_mode_privacy():
-    # Reuse the same implementation as the form POST route
-    return mode_privacy()
+    # API callers get JSON, not a redirect
+    run_id = _run_mode_async("privacy")
+    return jsonify({"ok": True, "run_id": run_id, "mode": "privacy"}), 200
 
 @app.post("/api/mode/normal")
 def api_mode_normal():
-    return mode_normal()
+    # API callers get JSON, not a redirect
+    run_id = _run_mode_async("normal")
+    return jsonify({"ok": True, "run_id": run_id, "mode": "normal"}), 200
 
 
 @app.get("/api/mode/switch")
@@ -1721,6 +1865,13 @@ def api_mode_switch_status():
         except Exception as e:
             st["systemd_error"] = str(e)
     return jsonify(st), 200
+
+
+@app.get("/api/status")
+def api_status():
+    """Convenience alias – returns the same payload as /api/anyone/proof."""
+
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=80, threaded=True)

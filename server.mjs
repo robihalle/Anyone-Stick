@@ -208,6 +208,107 @@ async function _cpGetInfo(cmdLine, timeoutMs=1500){
   });
 }
 
+
+// --- Raw SETCONF helper (eigener Socket, unabhaengig von SDK-Queue) ---
+async function _rawSetconf(kvPairs, timeoutMs) {
+  timeoutMs = timeoutMs || 8000;
+  const cookie = fs.readFileSync(COOKIE_PATH);
+  const hex = cookie.toString("hex");
+  const cmd =
+    "AUTHENTICATE " + hex + "\r\n" +
+    "SETCONF " + kvPairs.join(" ") + "\r\n" +
+    "QUIT\r\n";
+
+  return await new Promise((resolve, reject) => {
+    const sock = net.connect({ host: CONTROL_HOST, port: CONTROL_PORT });
+    let buf = "";
+    let done = false;
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { sock.destroy(); } catch {}
+      reject(new Error("_rawSetconf timeout after " + timeoutMs + "ms"));
+    }, timeoutMs);
+
+    sock.on("connect", () => {
+      try { sock.write(cmd); } catch (e) {
+        if (done) return; done = true; clearTimeout(timer);
+        try { sock.destroy(); } catch {}
+        reject(e);
+      }
+    });
+    sock.on("data", (chunk) => {
+      buf += chunk.toString("utf-8");
+      if (/^250 OK/m.test(buf) || /^[45]\d\d /m.test(buf)) {
+        if (done) return; done = true; clearTimeout(timer);
+        try { sock.end(); } catch {}
+        if (/^250 OK/m.test(buf)) resolve(true);
+        else reject(new Error("_rawSetconf error: " + buf.trim()));
+      }
+    });
+    sock.on("error", (e) => {
+      if (done) return; done = true; clearTimeout(timer); reject(e);
+    });
+    sock.on("close", () => {
+      if (done) return; done = true; clearTimeout(timer);
+      if (/^250 OK/m.test(buf)) resolve(true);
+      else reject(new Error("_rawSetconf closed without 250 OK: " + buf.trim()));
+    });
+  });
+}
+// --- /Raw SETCONF helper ---
+// --- Raw SIGNAL NEWNYM helper (eigener Socket, unabhaengig von SDK-Queue) ---
+async function _rawSignalNewnym(timeoutMs) {
+  timeoutMs = timeoutMs || 8000;
+  const cookie = fs.readFileSync(COOKIE_PATH);
+  const hex = cookie.toString("hex");
+  const cmd =
+    "AUTHENTICATE " + hex + "\r\n" +
+    "SIGNAL NEWNYM\r\n" +
+    "QUIT\r\n";
+
+  return await new Promise((resolve, reject) => {
+    const sock = net.connect({ host: CONTROL_HOST, port: CONTROL_PORT });
+    let buf = "";
+    let done = false;
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { sock.destroy(); } catch {}
+      reject(new Error("_rawSignalNewnym timeout after " + timeoutMs + "ms"));
+    }, timeoutMs);
+
+    sock.on("connect", () => {
+      try { sock.write(cmd); } catch (e) {
+        if (done) return; done = true; clearTimeout(timer);
+        try { sock.destroy(); } catch {}
+        reject(e);
+      }
+    });
+    sock.on("data", (chunk) => {
+      buf += chunk.toString("utf-8");
+      if (/^250 OK/m.test(buf) || /^[45]\d\d /m.test(buf)) {
+        if (done) return; done = true; clearTimeout(timer);
+        try { sock.end(); } catch {}
+        if (/^250 OK/m.test(buf)) resolve(true);
+        else reject(new Error("_rawSignalNewnym error: " + buf.trim()));
+      }
+    });
+    sock.on("error", (e) => {
+      if (done) return; done = true; clearTimeout(timer); reject(e);
+    });
+    sock.on("close", () => {
+      if (done) return; done = true; clearTimeout(timer);
+      if (/^250 OK/m.test(buf)) resolve(true);
+      else reject(new Error("_rawSignalNewnym closed without 250 OK: " + buf.trim()));
+    });
+  });
+}
+// --- /Raw SIGNAL NEWNYM helper ---
+
+
 function _parseIpToCountry(txt){
   const t = String(txt || "");
   let m = t.match(/ip-to-country\/[0-9a-fA-F\.:]+=\s*([A-Za-z]{2})/);
@@ -505,7 +606,7 @@ let _cacheTs = 0;
 let _cacheTimer = null;
 let _circuitFirstSeen = new Map();  // Track when circuits were first seen
 let _rebuilding = false;
-let _pendingRebuild = null;  // queued rebuild reason
+let _pendingRebuild = [];    // PATCH: multi-queue of pending rebuild reasons
 let _bootstrapping = false;
 
 // Rotation
@@ -536,6 +637,48 @@ function effectiveExitCountriesInternal() {
 function effectiveExitCountriesForStatus() {
   const eff = effectiveExitCountriesInternal();
   return (eff || []).map((c) => String(c || "").toUpperCase()).filter(Boolean);
+}
+function desiredHopCount() {
+  // "desired" is whatever CURRENT_HOPCOUNT expresses (normalized to 2|3)
+  return effectiveHopCount();
+}
+
+function desiredExitCountriesForStatus() {
+  // Uppercase for portal select compatibility
+  return effectiveExitCountriesForStatus();
+}
+
+function _newestCachedCircuit() {
+  try {
+    if (typeof _cacheCircuits === "undefined") return null;
+    if (!Array.isArray(_cacheCircuits) || _cacheCircuits.length === 0) return null;
+    // cache is old->new; newest is last
+    return _cacheCircuits[_cacheCircuits.length - 1] || null;
+  } catch {
+    return null;
+  }
+}
+
+function observedHopCount() {
+  try {
+    const c = _newestCachedCircuit();
+    const hops = c && Array.isArray(c.hops) ? c.hops : null;
+    return hops ? hops.length : null;
+  } catch {
+    return null;
+  }
+}
+
+function observedExitCountry() {
+  try {
+    const c = _newestCachedCircuit();
+    const hops = c && Array.isArray(c.hops) ? c.hops : [];
+    const last = hops.length ? hops[hops.length - 1] : null;
+    const cc = String(last?.country_code || "").trim().toUpperCase();
+    return cc || null;
+  } catch {
+    return null;
+  }
 }
 
 function exitCountriesForBuilding() {
@@ -1028,15 +1171,10 @@ async function _refreshCircuitCache(){
     // 3) Accept READY as "built-like" too (vpn-state-manager often uses READY)
     out = out.filter(c => {
       const u = String(c?.status || "").toUpperCase();
-      // Some implementations report BUILT/READY, others OPEN/ESTABLISHED.
-      return (
-        u.startsWith("BUILT") ||
-        u.startsWith("READY") ||
-        u === "OPEN" ||
-        u === "ESTABLISHED" ||
-        u.startsWith("OPEN") ||
-        u.startsWith("ESTABLISH")
-      );
+      // Per anon-protocol-npm reference (models.ts CircuitStatus):
+      // Valid states from GETINFO circuit-status are: LAUNCHED, BUILT, EXTENDED, FAILED, CLOSED
+      // Only BUILT means the circuit is ready for traffic.
+      return u === "BUILT" || u.startsWith("BUILT");
     });
 
     out.sort((a,b) => (a.first_seen_ts||0) - (b.first_seen_ts||0));
@@ -1082,7 +1220,7 @@ function _startCircuitCache() {
       _refreshRelayIndex();
       await _refreshCircuitCache();
     } catch {}
-  }, 10000);
+  }, 30000); // PATCH: reduced cache polling
 }
 
 // --- Fast background relay IP → country resolver ---
@@ -1197,7 +1335,7 @@ async function _fastBackgroundResolve() {
 // === PATCH: Manual circuit-status via raw ControlPort (bypasses broken SDK) ===
 async function manualCircuitStatus() {
   try {
-    const resp = await control.msgAsync("GETINFO circuit-status");
+    const resp = await _ctrlCmd("GETINFO circuit-status");
     // resp can be: { data: "..." } or just a string, or { type: "...", data: "..." }
     let text = "";
     if (typeof resp === "string") text = resp;
@@ -1269,7 +1407,7 @@ function _ensureRotationTimer() {
     _rotationNextTs = Math.floor(Date.now() / 1000) + Math.round(nextMs / 1000);
     _rotationTimer = setTimeout(async () => {
       _rotationLastTs = Math.floor(Date.now() / 1000);
-      try { await rebuildVPNManager("rotation"); } catch {}
+      try { await _withRetry("rotation", 3, 2000); } catch {}
       scheduleOnce();
     }, nextMs);
   };
@@ -1288,8 +1426,10 @@ function _stopRotationTimer() {
 async function rebuildVPNManager(reason = "manual") {
   console.error("[rebuildVPNManager] ENTER reason=" + reason + " _rebuilding=" + _rebuilding + " READY=" + READY);
   if (_rebuilding) {
-    _pendingRebuild = reason;
-    console.error("[rebuildVPNManager] QUEUED reason=" + reason);
+    // PATCH: multi-queue — collect all pending reasons, last-in-wins per semantic group
+    if (!Array.isArray(_pendingRebuild)) _pendingRebuild = [];
+    _pendingRebuild.push(reason);
+    console.error("[rebuildVPNManager] QUEUED reason=" + reason + " queue=" + JSON.stringify(_pendingRebuild));
     return { ok: true, queued: true, reason };
   }
   if (!READY || !control || !stateManager) {
@@ -1298,43 +1438,112 @@ async function rebuildVPNManager(reason = "manual") {
   }
 
   _rebuilding = true;
+  // PATCH: Immediately clear stale cache so /status.observed reflects rebuild
+  _cacheCircuits = [];
+  _cacheTs = 0;
   try {
     _stopRotationTimer();
 
-    try {
-      if (vpnManager && typeof vpnManager.shutdown === "function") {
-        await vpnManager.shutdown();
-      }
-    } catch {}
-    vpnManager = null;
+    // --- MAKE-BEFORE-BREAK: Build new BEFORE destroying old ---
+    const oldVpnManager = vpnManager;
 
-    try { await _ctrlCmd("SIGNAL NEWNYM", 6000); } catch {}
-    await _closeGeneralCircuits();
-
+    // Refresh relay data for new circuit building
     try {
       if (typeof stateManager.refreshRelays === "function") {
         await stateManager.refreshRelays();
       }
     } catch {}
 
-    // DEBUG: Log exit countries being used
-    const _rebuiltTargets = buildTargets(effectiveHopCount());
+    // Build new targets with current settings
+    const newTargets = buildTargets(effectiveHopCount());
     console.error("[rebuildVPNManager] CURRENT_EXIT_COUNTRIES =", JSON.stringify(CURRENT_EXIT_COUNTRIES));
-    console.error("[rebuildVPNManager] targets[0].exitCountries =", JSON.stringify(_rebuiltTargets[0]?.exitCountries));
-    
-    vpnManager = new Anyone.VPNManager(stateManager, {
-      targets: _rebuiltTargets,
+    console.error("[rebuildVPNManager] targets[0].exitCountries =", JSON.stringify(newTargets[0]?.exitCountries));
+
+    // Create and initialize new VPNManager (old one still serves traffic!)
+    const newVpnManager = new Anyone.VPNManager(stateManager, {
+      targets: newTargets,
       healthMonitorInterval: 15000,
-      disablePredictedCircuits: true,
-      disableConflux: true,
+      // disablePredictedCircuits + disableConflux handled via _rawSetconf above
+      // to avoid SDK-internal SETCONF timeout on congested ControlPort queue
     });
-    await Promise.race([
-      vpnManager.initialize(),
-      new Promise(resolve => setTimeout(() => {
-        console.error("[vpnManager.initialize] timed out after 90s - continuing anyway");
-        resolve();
-      }, 90000))
-    ]);
+
+    let initOk = false;
+    try {
+      // Pre-set SETCONF via raw socket BEFORE initialize()
+      try {
+        await _rawSetconf(['__LeaveStreamsUnattached="1"', 'DisablePredictedCircuits=1'], 8000);
+        console.error("[rebuildVPNManager] _rawSetconf OK");
+      } catch (setconfErr) {
+        console.error("[rebuildVPNManager] _rawSetconf failed (non-fatal):", setconfErr?.message || setconfErr);
+      }
+      await Promise.race([
+        newVpnManager.initialize(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("init timeout 60s")), 60000))
+      ]);
+      initOk = true;
+    } catch (initErr) {
+      console.error("[rebuildVPNManager] New VPNManager init failed:", initErr?.message || initErr);
+    }
+
+    if (initOk) {
+      // === BREAK: Now that new circuits are ready, tear down old ===
+      vpnManager = newVpnManager;
+      console.error("[rebuildVPNManager] Switched to new VPNManager (make-before-break)");
+
+      // Shut down old manager (closes old circuits gracefully)
+      try {
+        if (oldVpnManager && typeof oldVpnManager.shutdown === "function") {
+          await oldVpnManager.shutdown();
+        }
+      } catch {}
+
+      // Clean up leftover GENERAL circuits from old manager
+      // PATCH: Cache sofort refreshen nach Switch, stale circuits erst nach 8s
+      _refreshCircuitCache().catch(() => {});
+      setTimeout(async () => {
+        try { await _closeStaleCircuits(); } catch {}
+      }, 8000);
+
+    } else {
+      // Init failed — fall back to hard rebuild (old behavior)
+      console.error("[rebuildVPNManager] Falling back to hard rebuild...");
+      try {
+        if (newVpnManager && typeof newVpnManager.shutdown === "function") {
+          await newVpnManager.shutdown();
+        }
+      } catch {}
+
+      try {
+        if (oldVpnManager && typeof oldVpnManager.shutdown === "function") {
+          await oldVpnManager.shutdown();
+        }
+      } catch {}
+      vpnManager = null;
+
+      // [OPT1a] NEWNYM removed from hop-switch (caused 10-15s blackout)
+      // try { await _ctrlCmd("SIGNAL NEWNYM", 30000); } catch {}
+      await _closeGeneralCircuits();
+
+      vpnManager = new Anyone.VPNManager(stateManager, {
+        targets: newTargets,
+        healthMonitorInterval: 15000,
+        // disablePredictedCircuits + disableConflux handled via _rawSetconf
+      });
+      // Pre-set SETCONF via raw socket BEFORE initialize()
+      try {
+        await _rawSetconf(['__LeaveStreamsUnattached="1"', 'DisablePredictedCircuits=1'], 8000);
+        console.error("[rebuildVPNManager] _rawSetconf OK");
+      } catch (setconfErr) {
+        console.error("[rebuildVPNManager] _rawSetconf failed (non-fatal):", setconfErr?.message || setconfErr);
+      }
+      await Promise.race([
+        vpnManager.initialize(),
+        new Promise(resolve => setTimeout(() => {
+          console.error("[vpnManager.initialize] fallback timed out after 90s - continuing anyway");
+          resolve();
+        }, 45000))
+      ]);
+    }
 
     _refreshRelayIndex();
     await _refreshCircuitCache();
@@ -1348,15 +1557,227 @@ async function rebuildVPNManager(reason = "manual") {
   } finally {
     _rebuilding = false;
     console.error("[rebuildVPNManager] EXIT reason=" + reason);
-    if (_pendingRebuild) {
-      const nextReason = _pendingRebuild;
-      _pendingRebuild = null;
+    if (Array.isArray(_pendingRebuild) && _pendingRebuild.length) {
+      // PATCH: drain queue — use last reason (most recent wins)
+      const nextReason = _pendingRebuild[_pendingRebuild.length - 1];
+      _pendingRebuild = [];
       console.error("[rebuildVPNManager] Running queued rebuild reason=" + nextReason);
       setTimeout(() => rebuildVPNManager(nextReason).catch(e =>
         console.error("[rebuildVPNManager] queued rebuild failed:", e?.message || e)
       ), 100);
+    } else {
+      _pendingRebuild = [];
     }
   }
+}
+
+// Helper: close old GENERAL circuits that don't belong to current VPNManager
+
+// -----------------------------------------------------------------------------
+// _withRetry: Fuehrt rebuildVPNManager bis zu maxAttempts mal aus.
+// -----------------------------------------------------------------------------
+async function _withRetry(reason = "manual", maxAttempts = 3, delayMs = 2000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(`[_withRetry] Attempt ${attempt}/${maxAttempts} reason=${reason}...`);
+      await rebuildVPNManager(reason);
+      console.log(`[_withRetry] Success on attempt ${attempt}`);
+      return { ok: true };
+    } catch (err) {
+      console.error(`[_withRetry] Attempt ${attempt} failed:`, err.message);
+      if (attempt < maxAttempts) {
+        console.log(`[_withRetry] Waiting ${delayMs}ms before retry (no NEWNYM)...`);
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+  console.error(`[_withRetry] All ${maxAttempts} attempts failed`);
+  return { ok: false, error: "All attempts failed" };
+}
+
+
+// -----------------------------------------------------------------------------
+// Step 4: Explicit Circuit Building mit EXTENDCIRCUIT
+// -----------------------------------------------------------------------------
+
+function _getGuards() {
+  if (!stateManager || typeof stateManager.getRelays !== "function") return [];
+  const relays = stateManager.getRelays() || [];
+  return relays.filter(r => 
+    r.flags && r.flags.includes("Guard") && 
+    r.flags.includes("Running") && 
+    r.flags.includes("Stable")
+  );
+}
+
+function _getMiddles() {
+  if (!stateManager || typeof stateManager.getRelays !== "function") return [];
+  const relays = stateManager.getRelays() || [];
+  return relays.filter(r => 
+    r.flags && 
+    r.flags.includes("Running") && 
+    r.flags.includes("Stable") &&
+    !r.flags.includes("BadExit")
+  );
+}
+
+function _getExitsForCountry(countryCode) {
+  const cc = String(countryCode || "").toLowerCase();
+  // Try exitsByCountry Map first
+  if (stateManager && stateManager.exitsByCountry) {
+    const m = stateManager.exitsByCountry;
+    if (m instanceof Map && m.has(cc)) return [...m.get(cc)];
+    if (m[cc]) return [...m[cc]];
+  }
+  // Fallback: filter from all relays
+  if (stateManager && typeof stateManager.getRelays === "function") {
+    const relays = stateManager.getRelays() || [];
+    return relays.filter(r => 
+      r.flags && r.flags.includes("Exit") && 
+      r.flags.includes("Running") &&
+      !r.flags.includes("BadExit") &&
+      String(r.country || "").toLowerCase() === cc
+    );
+  }
+  return [];
+}
+
+function _shuffleArray(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function _selectPath(hopCount, exitCountry) {
+  const guards = _shuffleArray(_getGuards());
+  const exits = _shuffleArray(_getExitsForCountry(exitCountry));
+  
+  if (guards.length === 0) {
+    console.error("[_selectPath] No guards available");
+    return null;
+  }
+  if (exits.length === 0) {
+    console.error(`[_selectPath] No exits for country ${exitCountry}`);
+    return null;
+  }
+
+  const guard = guards[0];
+  const exit = exits[0];
+
+  if (hopCount === 2) {
+    if (guard.fingerprint === exit.fingerprint) {
+      // Try next guard
+      for (const g of guards.slice(1)) {
+        if (g.fingerprint !== exit.fingerprint) {
+          return [g, exit];
+        }
+      }
+      return null;
+    }
+    return [guard, exit];
+  }
+
+  // 3-hop: guard + middle + exit
+  const middles = _shuffleArray(_getMiddles());
+  for (const middle of middles.slice(0, 20)) {
+    if (guard.fingerprint !== middle.fingerprint &&
+        guard.fingerprint !== exit.fingerprint &&
+        middle.fingerprint !== exit.fingerprint) {
+      return [guard, middle, exit];
+    }
+  }
+  console.error("[_selectPath] Could not find valid 3-hop path");
+  return null;
+}
+
+async function buildExplicitCircuit(hopCount, exitCountry, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const path = _selectPath(hopCount, exitCountry);
+    if (!path) {
+      console.error(`[buildExplicitCircuit] Attempt ${attempt}: No valid path`);
+      continue;
+    }
+
+    const serverSpecs = path.map(r => "$" + r.fingerprint).join(",");
+    const cmd = `EXTENDCIRCUIT 0 ${serverSpecs}`;
+    console.log(`[buildExplicitCircuit] Attempt ${attempt}: ${cmd}`);
+
+    try {
+      const resp = await _ctrlCmd(cmd, 30000);
+      const respStr = String(resp);
+      // Response: "250 EXTENDED <circuitId>"
+      const match = respStr.match(/250 EXTENDED (\d+)/);
+      if (match) {
+        const circuitId = parseInt(match[1], 10);
+        console.log(`[buildExplicitCircuit] Success! Circuit ${circuitId} built via ${path.map(r => r.fingerprint.slice(0,8)).join(" -> ")}`);
+        return { circuitId, path, exitCountry };
+      } else {
+        console.error(`[buildExplicitCircuit] Unexpected response: ${respStr}`);
+      }
+    } catch (err) {
+      console.error(`[buildExplicitCircuit] Attempt ${attempt} failed:`, err.message);
+    }
+
+    // Wait before retry
+    if (attempt < maxRetries) {
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  console.error(`[buildExplicitCircuit] All ${maxRetries} attempts failed for ${exitCountry}`);
+  return null;
+}
+
+// Exported for debugging via /debug endpoint
+const explicitCircuitHelpers = {
+  getGuards: _getGuards,
+  getMiddles: _getMiddles,
+  getExitsForCountry: _getExitsForCountry,
+  selectPath: _selectPath,
+  buildExplicitCircuit
+};
+
+
+async function _closeStaleCircuits() {
+  if (!control) return;
+  // PATCH: Guard gegen Race Condition
+  if (_rebuilding || _bootstrapping) {
+    console.error("[_closeStaleCircuits] Skipped - rebuild/bootstrap in progress");
+    return;
+  }
+  try {
+    const status = await controlCircuitStatusSafe();
+    const knownIds = new Set();
+    if (vpnManager) {
+      try {
+        const vmCircs = vpnManager.circuits || vpnManager._circuits;
+        if (vmCircs && typeof vmCircs.keys === "function") {
+          for (const k of vmCircs.keys()) knownIds.add(Number(k));
+        }
+      } catch {}
+    }
+    // PATCH: Circuits juenger als 15s schuetzen
+    const nowSec = Date.now() / 1000;
+    const stale = (status || [])
+      .filter(c => {
+        const purpose = String(c.purpose || "").toUpperCase();
+        const id = Number(c.circuitId ?? c.id);
+        if (purpose !== "GENERAL" || !Number.isFinite(id) || knownIds.has(id)) return false;
+        const firstSeen = _circuitFirstSeen.get(id);
+        if (firstSeen && (nowSec - firstSeen) < 15) {
+          console.error("[_closeStaleCircuits] Sparing young circuit " + id + " (age=" + Math.round(nowSec - firstSeen) + "s)");
+          return false;
+        }
+        return true;
+      });
+    for (const c of stale) {
+      const id = Number(c.circuitId ?? c.id);
+      try { await control.closeCircuit(id); } catch {}
+    }
+    if (stale.length) console.error("[_closeStaleCircuits] Closed " + stale.length + " stale circuits");
+  } catch {}
 }
 
 // -----------------------------------------------------------------------------
@@ -1390,12 +1811,19 @@ async function initManagersOnce() {
     disablePredictedCircuits: true,
     disableConflux: true,
   });
+  // Pre-set SETCONF via raw socket before first initialize()
+  try {
+    await _rawSetconf(['__LeaveStreamsUnattached="1"', 'DisablePredictedCircuits=1'], 8000);
+    console.error("[initManagersOnce] _rawSetconf OK");
+  } catch (setconfErr) {
+    console.error("[initManagersOnce] _rawSetconf failed (non-fatal):", setconfErr?.message || setconfErr);
+  }
   await Promise.race([
     vpnManager.initialize(),
     new Promise(resolve => setTimeout(() => {
-      console.error("[vpnManager.initialize] timed out after 90s - continuing anyway");
+      console.error("[vpnManager.initialize] timed out after 45s - continuing anyway");
       resolve();
-    }, 90000))
+    }, 45000))
   ]);
 
   _startCircuitCache();
@@ -1408,6 +1836,8 @@ async function initManagersOnce() {
 }
 
 async function bootstrapLoop() {
+  _bootstrapStartedAt = Date.now();
+  _bootstrapStartedAt = Date.now();
   for (;;) {
     try {
       await initManagersOnce();
@@ -1428,6 +1858,8 @@ async function bootstrapLoop() {
 // -----------------------------------------------------------------------------
 // API server
 // -----------------------------------------------------------------------------
+let _bootstrapStartedAt = 0;
+let _lastBootstrapDone = 0;
 const app = express();
 
 function _availableExitCountriesLower(){
@@ -1591,7 +2023,7 @@ app.get("/circuit", (_req, res) => {
       ? _cacheCircuits[_cacheCircuits.length - 1]
       : null;
     const hops = c && Array.isArray(c.hops) ? c.hops : [];
-    res.json({ ok: true, hops });
+    res.json({ ok: true, hops, desiredHopCount: desiredHopCount(), desiredExitCountries: desiredExitCountriesForStatus(), observedHopCount: observedHopCount(), observedExitCountry: observedExitCountry() });
   } catch (e) {
     res.json({ ok: false, error: String(e?.message || e), hops: [] });
   }
@@ -1604,6 +2036,16 @@ app.get("/status", (_req, res) => {
     bootstrapping: _bootstrapping,
     lastInitTs: INIT_LAST_TS,
     error: INIT_ERROR || null,
+    desired: {
+      hopCount: desiredHopCount(),
+      exitCountries: desiredExitCountriesForStatus(),
+    },
+    observed: {
+      hopCount: observedHopCount(),
+      exitCountry: observedExitCountry(),
+    },
+    rebuilding: _rebuilding,
+    pendingRebuild: _pendingRebuild || null,
     hopCount: effectiveHopCount(),
     exitCountries: effectiveExitCountriesForStatus(), // uppercase for portal select compatibility
     rotation,
@@ -1637,17 +2079,24 @@ app.get("/circuits", (req, res) => {
 app.post("/hopmode", async (req, res) => {
   const hopCount = Number(req.body?.hopCount || req.body?.hops || 3);
   CURRENT_HOPCOUNT = hopCount === 2 ? 2 : 3;
-  const r = await rebuildVPNManager("hopmode");
-  res.json({ ...r, hopCount: effectiveHopCount() });
+  // Fire-and-forget: respond immediately, rebuild in background
+  _withRetry("hopmode", 3, 2000).catch(e => console.error("[/hopmode] bg rebuild error:", e));
+  res.json({ ok: true, queued: true, hopCount: effectiveHopCount() });
 });
 
 app.post("/exit", async (req, res) => {
-  const cc = String(req.body?.exitCountry || "AUTO").trim().toUpperCase();
+  // Support both exitCountry (string) and exitCountries (array)
+  let _cc, desired;
+  if (Array.isArray(req.body?.exitCountries) && req.body.exitCountries.length > 0) {
+    desired = req.body.exitCountries.map(c => String(c).trim().toLowerCase()).filter(Boolean);
+    _cc = desired.map(c => c.toUpperCase()).join(',');
+  } else {
+    _cc = String(req.body?.exitCountry || req.body?.exitCountries || req.body?.country || "AUTO").trim().toUpperCase();
+    desired = (_cc === "AUTO" || !_cc) ? [] : [_cc.toLowerCase()];
+  }
+  const cc = desired.length === 1 ? desired[0].toUpperCase() : (desired.length === 0 ? "AUTO" : _cc);
   const wait = Boolean(req.body?.wait);
   const timeoutMs = Math.max(2000, Number(req.body?.timeoutMs || 30000));
-
-  // Desired exit filter (internal is lower-case)
-  const desired = (cc === "AUTO" || !cc) ? [] : [cc.toLowerCase()];
 
   // Validate against available exit countries (best-effort)
   const avail = _availableExitCountriesLower();
@@ -1655,21 +2104,28 @@ app.post("/exit", async (req, res) => {
     // Land trotzdem setzen — Relays koennen spaeter verfuegbar werden
     console.error("[/exit] WARNING: " + cc + " not in relay list, setting anyway");
     CURRENT_EXIT_COUNTRIES = desired;
-    const r0 = await rebuildVPNManager("exit");
+    _withRetry("exit", 3, 2000).catch(e => console.error("[/exit] bg rebuild error:", e));
     return res.json({
       ok: true,
+      queued: true,
       warning: `Exit ${cc} may have limited relays right now`,
       exitCountries: effectiveExitCountriesForStatus(),
-      rebuild: r0
     });
   }
 
   CURRENT_EXIT_COUNTRIES = desired;
   console.error("[/exit] Set CURRENT_EXIT_COUNTRIES to:", JSON.stringify(desired));
 
-  const r = await rebuildVPNManager("exit");
+  if (!wait) {
+    // Fire-and-forget: respond immediately, rebuild in background
+    _withRetry("exit", 3, 2000).catch(e => console.error("[/exit] bg rebuild error:", e));
+    res.json({ ok: true, queued: true, exitCountries: effectiveExitCountriesForStatus() });
+    return;
+  }
 
-  if (!wait || !r.ok) {
+  const r = await _withRetry("exit", 3, 2000);
+
+  if (!r.ok) {
     res.json({ ...r, exitCountries: effectiveExitCountriesForStatus() });
     return;
   }
@@ -1679,10 +2135,10 @@ app.post("/exit", async (req, res) => {
   let matched = false;
   while (Date.now() - t0 < timeoutMs) {
     await sleep(600);
-    const cur = (_cacheCircuits[0]?.hops || []).slice(-1)[0];
+    const cur = (_cacheCircuits[_cacheCircuits.length - 1]?.hops || []).slice(-1)[0];
     const curCC = String(cur?.country_code || "").toUpperCase();
     if (cc === "AUTO") {
-      if ((_cacheCircuits[0]?.hops || []).length) { matched = true; break; }
+      if ((_cacheCircuits[_cacheCircuits.length - 1]?.hops || []).length) { matched = true; break; }
     } else {
       if (curCC === cc) { matched = true; break; }
     }
@@ -1706,10 +2162,20 @@ app.post("/exit", async (req, res) => {
 app.post("/newnym", async (_req, res) => {
   if (!control) return res.json({ ok: false, error: "not_ready" });
   try {
-    await _ctrlCmd("SIGNAL NEWNYM", 6000);
+    // FIX: Use raw socket for SIGNAL NEWNYM (avoids SDK defaultQueue congestion)
+    await _rawSignalNewnym(8000);
+    // Also trigger a circuit cache refresh so UI updates quickly
+    _refreshCircuitCache().catch(() => {});
     res.json({ ok: true });
   } catch (e) {
-    res.json({ ok: false, error: String(e) });
+    // Fallback to SDK if raw fails
+    try {
+      await _ctrlCmd("SIGNAL NEWNYM", 15000);
+      _refreshCircuitCache().catch(() => {});
+      res.json({ ok: true, fallback: true });
+    } catch (e2) {
+      res.json({ ok: false, error: String(e2) });
+    }
   }
 });
 
@@ -1754,7 +2220,7 @@ app.post("/rotation", (req, res) => {
 });
 
 app.post("/rotation/trigger", async (_req, res) => {
-  const r = await rebuildVPNManager("rotation_trigger");
+  const r = await _withRetry("rotation_trigger", 3, 2000);
   res.json(r);
 });
 
@@ -1777,6 +2243,69 @@ app.get("/debug/relay-sample", async (req, res) => {
     res.json({ error: String(e) });
   }
 });
+
+app.get("/debug/explicit-circuit", async (req, res) => {
+  const hops = parseInt(req.query.hops || "3", 10);
+  const country = String(req.query.country || "de").toLowerCase();
+  
+  const guards = _getGuards().length;
+  const exits = _getExitsForCountry(country).length;
+  const path = _selectPath(hops, country);
+  
+  res.json({
+    hops,
+    country,
+    guardsAvailable: guards,
+    exitsAvailable: exits,
+    selectedPath: path ? path.map(r => ({
+      fp: r.fingerprint.slice(0, 8) + "...",
+      nick: r.nickname,
+      flags: r.flags
+    })) : null
+  });
+});
+
+app.post("/debug/build-circuit", async (req, res) => {
+  const hops = parseInt(req.body?.hops || "3", 10);
+  const country = String(req.body?.country || "de").toLowerCase();
+  
+  try {
+    const result = await buildExplicitCircuit(hops, country, 3);
+    if (result) {
+      res.json({ success: true, ...result, path: result.path.map(r => r.fingerprint.slice(0,8)) });
+    } else {
+      res.status(500).json({ success: false, error: "All attempts failed" });
+    }
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+
+// ── Wait-ready: blocks until at least 1 circuit is BUILT or timeout ──
+app.get("/wait-ready", async (req, res) => {
+  const timeoutMs = Math.min(parseInt(req.query.timeout || "30000", 10), 60000);
+  const start = Date.now();
+  const poll = async () => {
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const circs = _cachedCircuits || [];
+        const built = circs.filter(c => {
+          const s = String(c?.status || "").toUpperCase();
+          return s.startsWith("BUILT") || s.startsWith("READY") || s === "OPEN" || s.startsWith("ESTABLISH");
+        });
+        if (built.length > 0) {
+          return res.json({ ready: true, circuits: built.length, elapsed: Date.now() - start });
+        }
+      } catch {}
+      await new Promise(r => setTimeout(r, 500));
+    }
+    res.json({ ready: false, circuits: 0, elapsed: Date.now() - start, timeout: true });
+  };
+  poll().catch(e => res.status(500).json({ error: e.message }));
+});
+
 app.listen(PORT, HOST, () => {
   console.log(`Circuit manager API on http://${HOST}:${PORT}`);
 });

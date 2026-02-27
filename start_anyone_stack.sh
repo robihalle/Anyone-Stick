@@ -6,8 +6,8 @@
 
 echo timer | sudo tee /sys/class/leds/default-on/trigger >/dev/null
 
-# 0. Ensure NORMAL mode on boot (internet passthrough by default)
-#    Privacy should only be enabled via the web UI button.
+# 0. Set initial firewall — will be overridden after Wi-Fi connects (see step 7b)
+#    Start with normal mode so host PC gets internet immediately.
 if [ -x /usr/local/bin/mode_normal.sh ]; then
     /usr/local/bin/mode_normal.sh || true
 fi
@@ -58,10 +58,18 @@ done
 
 # 7. Start anon (blocks — keeps service alive)
 
-# 7. Default boot behavior: NORMAL MODE (allow all traffic)
-#    This ensures the host PC has internet immediately.
-if [ -x /usr/local/bin/mode_normal.sh ]; then
-    /usr/local/bin/mode_normal.sh >/dev/null 2>&1 || true
+# 7b. Restore saved mode — if privacy was active before reboot, re-enable it.
+#     The marker file is written by mode_privacy.sh on successful activation.
+if [ -f /var/lib/anyone-stick/privacy_verified ]; then
+    echo "[boot] Restoring PRIVACY mode (marker found)..."
+    if [ -x /usr/local/bin/mode_privacy.sh ]; then
+        /usr/local/bin/mode_privacy.sh >/dev/null 2>&1 &
+        echo "[boot] mode_privacy.sh launched in background"
+    else
+        echo "[boot] WARNING: mode_privacy.sh not found, staying in normal mode"
+    fi
+else
+    echo "[boot] Normal mode (no privacy marker), nothing to restore."
 fi
 
 # Ensure KillSwitch is OFF by default (user enables it explicitly)

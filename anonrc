@@ -27,3 +27,11 @@ ClientUseIPv6 0
 
 # (IMPORTANT) Do NOT hard-pin ExitNodes here.
 # Exit selection is handled dynamically via ControlPort SETCONF by circuit-manager.
+
+
+# === Step 1: Circuit-Build & Performance Tuning (added 20260224_081042) ===
+LearnCircuitBuildTimeout 0
+CircuitBuildTimeout 30
+NumEntryGuards 2
+ConnectionPadding 0
+MaxCircuitDirtiness 600
