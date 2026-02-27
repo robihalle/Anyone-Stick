@@ -163,42 +163,31 @@ if ! command -v anon &>/dev/null; then
   curl -fsSL https://deb.anyone.io/gpg.key \
     | gpg --dearmor -o /usr/share/keyrings/anyone.gpg
 
-  # Detect distro — fall back to bookworm if unsupported
-  DISTRO=$(lsb_release -cs 2>/dev/null || echo "bookworm")
-  ANON_SUITE="anon-live-${DISTRO}"
-  # Test if suite exists; fall back to bookworm
-  if ! curl -fsSL --head "https://deb.anyone.io/dists/${ANON_SUITE}/Release" &>/dev/null; then
-    warn "Distro codename '${DISTRO}' is not supported by the Anyone repo."
-    warn "Falling back to 'bookworm' for anon package installation."
-    ANON_SUITE="anon-live-bookworm"
-  fi
-  log "Using anon repo suite: ${ANON_SUITE}"
-
-  echo "deb [signed-by=/usr/share/keyrings/anyone.gpg] https://deb.anyone.io ${ANON_SUITE} main" \
+  echo "deb [signed-by=/usr/share/keyrings/anyone.gpg] https://deb.anyone.io bookworm main" \
     > /etc/apt/sources.list.d/anyone.list
 
   apt-get update -qq
 
   # Pre-accept the Anyone license agreement (required for non-interactive install)
   export DEBIAN_FRONTEND=noninteractive
-  echo "anon anon/accepted-terms-and-conditions boolean true" \
-    | debconf-set-selections
+  echo "anon anon/terms boolean true" | debconf-set-selections
 
   apt-get install -y anon \
-    || error "Failed to install anon. Check if ${ANON_SUITE} is a valid repo suite."
+    || error "Failed to install anon."
 
   ok "anon installed: $(anon --version 2>&1 | head -1)"
 else
   ok "anon already installed: $(anon --version 2>&1 | head -1)"
 fi
 
-# Verify debian-anon user and /var/lib/anon exist (created by package postscript)
-id debian-anon &>/dev/null || error "debian-anon user missing -- is the anon package installed correctly?"
-[[ -d /var/lib/anon ]] || error "/var/lib/anon missing -- is the anon package installed correctly?"
+# Verify debian-anon user and /var/lib/anon exist (created by package postinst)
+id debian-anon &>/dev/null \
+  || error "debian-anon user missing — is the anon package installed correctly?"
+[[ -d /var/lib/anon ]] \
+  || error "/var/lib/anon missing — is the anon package installed correctly?"
 
-# Deploy anonrc
-mkdir -p /etc/anon
-copy_file "anonrc" "/etc/anon/anonrc" 644
+# Deploy anonrc to /etc/ (not /etc/anon/)
+copy_file "anonrc" "/etc/anonrc" 644
 
 # Ensure correct ownership of anon data + log directories
 chown -R debian-anon:debian-anon /var/lib/anon
@@ -220,11 +209,10 @@ done
 if [[ -f /var/lib/anon/control_auth_cookie ]]; then
   ok "control_auth_cookie ready (${i}s)"
 else
-  warn "control_auth_cookie not found after 30s -- circuit-manager may fail until reboot"
+  warn "control_auth_cookie not found after 30s — circuit-manager may fail until reboot"
 fi
 
 ok "anon configuration complete"
-
 
 # =============================================================================
 # 4 -- Node.js & Circuit Manager
