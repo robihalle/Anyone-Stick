@@ -1,118 +1,146 @@
 # Anyone Privacy Stick
 
-> Turn a Raspberry Pi Zero 2 W into a plug-and-play USB privacy stick that routes all traffic through the [Anyone](https://anyone.io) network.
+> Turn a **Raspberry Pi Zero 2 W** into a plug-and-play USB privacy stick that routes all your traffic through the [Anyone](https://anyone.io) network -- in under 15 minutes.
 
 ![Anyone Stick](logo.png)
 
-## Overview
+---
 
-The Pi Zero 2 W acts as a **USB privacy stick** with an integrated web portal.
-Using a USB gadget (NCM), it exposes a network interface (`usb0`) to the
-connected host and can switch between **Normal Mode** (standard NAT) and
-**Privacy Mode** (transparent TCP/DNS routing through the `anon` network).
+## Quick Start (TL;DR)
+
+```
+ What you need          What you do
+ --------------         --------------------------------------
+ 1x Pi Zero 2 W        1. Flash Raspberry Pi OS Lite (64-bit)
+ 1x microSD >= 8 GB    2. SSH in and run the installer
+ 1x USB data cable      3. Plug the Pi into your laptop
+ 1x Wi-Fi network       4. Open http://192.168.7.1 -- done!
+```
+
+---
+
+## What You Need (Shopping List)
+
+| Item | Notes |
+|---|---|
+| **Raspberry Pi Zero 2 W** | Must be the **2 W** model (quad-core, Wi-Fi) |
+| **microSD card** (>= 8 GB) | 16 GB recommended |
+| **USB data cable** | **WARNING:** Must be a **data** cable, not charge-only! If the Pi does not show up as a network device, try a different cable. |
+| **Computer** | Windows, macOS, or Linux -- anything with a USB port |
+| **Wi-Fi network** | The Pi needs internet access during installation and operation |
+
+Optional but helpful:
+- **microSD card reader** (if your computer does not have one built-in)
+- **USB-A to Micro-USB adapter** (if your computer only has USB-C, use a hub)
+
+---
+
+## Step-by-Step Installation
+
+### Step 1 -- Flash the SD Card
+
+1. Download and install [Raspberry Pi Imager](https://www.raspberrypi.com/software/)
+2. Choose **Raspberry Pi OS Lite (64-bit, Bookworm)** -- no desktop needed
+3. Click the gear icon (or Ctrl+Shift+X) and configure:
+   - **Enable SSH** (use password authentication)
+   - **Set username**: `pi` / password: (your choice)
+   - **Configure Wi-Fi**: enter your SSID and password
+   - **Set locale**: your timezone and keyboard layout
+4. Flash the SD card and insert it into the Pi
+
+### Step 2 -- Run the Installer
+
+Power the Pi (via any USB power source or your computer), wait ~60 seconds for boot, then:
+
+```bash
+# Find your Pi on the network (or use your router's DHCP list)
+# Then SSH in:
+ssh pi@<your-pi-ip-address>
+
+# Install git and clone the repo
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/robihalle/Anyone-Stick.git
+cd Anyone-Stick
+
+# Run the installer (takes ~10-15 minutes on Pi Zero 2W)
+sudo bash installer.sh
+```
+
+The installer will:
+1. Install all system packages
+2. Configure the USB gadget (NCM network interface)
+3. Install the Anyone Protocol (`anon`)
+4. Set up the Circuit Manager (Node.js)
+5. Set up the Web Portal (Flask/Gunicorn)
+6. Deploy all shell scripts and iptables rules
+7. Configure dnsmasq (DHCP for your computer)
+8. Disable nginx (not needed)
+9. Enable all systemd services
+
+**After installation, the Pi reboots automatically.**
+
+### Step 3 -- Plug In and Use
+
+1. **Plug the Pi into your computer** via the USB **data** port (the one closest to the center of the board, not the one on the edge labeled "PWR")
+2. **Wait ~60 seconds** for the Pi to boot
+3. **Open your browser** and go to: **http://192.168.7.1**
+4. You will see the Anyone Stick dashboard!
+
+> **First-time note**: The Anyone network needs 1-2 minutes to build its first circuit. The dashboard will show "Bootstrapping..." until the first circuit is ready.
+
+---
+
+## How It Works
+
+```
+Your Computer                        Pi Zero 2 W
++----------+    USB Cable    +-----------------------------+
+|          |<--------------->|  usb0: 192.168.7.1          |
+|  Browser |  NCM network    |    +- Web Portal (:80)      |
+|  Traffic |  192.168.7.x    |    +- Circuit Manager (:8787)|
+|          |                 |    +- dnsmasq (DHCP+DNS)    |
++----------+                 |                             |
+                             |  iptables (NAT or Proxy)    |
+                             |         |                   |
+                             |  anon (Anyone Protocol)     |
+                             |    +- TransPort  :9040      |
+                             |    +- DNSPort    :9053      |
+                             |    +- SocksPort  :9050      |
+                             |         |                   |
+                             |  wlan0 --> Wi-Fi --> Internet|
+                             +-----------------------------+
+```
+
+---
 
 ## Features
 
 | Feature | Description |
 |---|---|
-| **USB Gadget (NCM)** | Creates `usb0` for the host - plug-and-play, no drivers needed |
-| **Web Portal** | Status dashboard, Wi-Fi management, mode switch, exit country selector, circuit visualization |
-| **Normal Mode** | Standard NAT - `usb0` to `wlan0` |
-| **Privacy Mode** | Transparent TCP proxy (`:9040`) + DNS redirect (`:9053`) through `anon` |
-| **Kill Switch** | `FORWARD DROP` - no traffic leaks if the tunnel goes down |
-| **2-Hop / 3-Hop** | Switch circuit length via the dashboard |
-| **Exit Country** | Choose exit node country from the portal |
-| **Circuit Rotation** | Automatic rotation with configurable interval and variance |
-| **New Identity** | Request a fresh circuit on demand (NewNym) |
-| **Circuit Visualization** | Real-time display of relay hops (role, flags, nickname, IP, country) |
-| **Anyone Proof** | Verifies connectivity through the Anyone network via SOCKS5 |
-| **Stream Isolation** | `IsolateDestAddr` / `IsolateDestPort` on SOCKS and DNS ports |
-| **DNS Leak Protection** | All DNS forced through the tunnel; UDP leak prevention |
+| **Plug and Play** | Just plug the Pi into USB -- no drivers needed (NCM gadget) |
+| **Web Portal** | Dashboard with status, Wi-Fi settings, mode switch, circuit visualization |
+| **Normal Mode** | Standard internet via NAT -- no privacy routing |
+| **Privacy Mode** | All TCP traffic transparently routed through the Anyone network |
+| **Kill Switch** | `FORWARD DROP` -- zero traffic leaks if the tunnel drops |
+| **2-Hop / 3-Hop** | Toggle circuit length: faster (2-hop) or more anonymous (3-hop) |
+| **Exit Country** | Choose which country your traffic exits from |
+| **Circuit Rotation** | Automatic rotation with configurable interval |
+| **New Identity** | Request a fresh circuit on demand |
+| **Circuit Visualization** | See your relay chain in real-time (flags, nickname, IP, country) |
+| **Anyone Proof** | Verify your connection through the Anyone network |
+| **Stream Isolation** | Separate circuits per destination |
+| **DNS Leak Protection** | All DNS queries forced through the tunnel |
 
-## Architecture
+---
 
-```
-Host Computer
-  usb0 (NCM) - DHCP: 192.168.7.x
-         |
-         | USB Cable
-         |
-Pi Zero 2 W
-  usb0: 192.168.7.1 (static)
-    |- dnsmasq (DHCP + DNS for host)
-    |- Flask Portal (:80 via gunicorn)
-    |- Circuit Manager (:8787 - Node.js sidecar)
-         |
-         | iptables
-         |
-  anon (Privacy Mode)
-    |- TransPort  :9040  (transparent TCP proxy)
-    |- DNSPort    :9053  (tunnel DNS)
-    |- SocksPort  :9050  (stream-isolated SOCKS)
-         |
-  wlan0 -> Internet (via Wi-Fi)
-```
-
-## Requirements
-
-- Raspberry Pi Zero 2 W
-- microSD card (>= 8 GB)
-- Raspberry Pi OS Lite (Bookworm, 64-bit)
-- USB data cable (not charge-only)
-- Wi-Fi network with internet access
-
-## Installation
-
-### 1 - Prepare the SD card
-
-Flash **Raspberry Pi OS Lite (Bookworm 64-bit)** with Raspberry Pi Imager.
-Enable SSH and configure Wi-Fi in the imager settings.
-
-### 2 - Connect and run the installer
-
-```bash
-ssh pi@<ip-address>
-sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/robihalle/Anyone-Stick.git
-cd Anyone-Stick
-sudo bash installer.sh
-```
-
-The installer runs **9 automated sections**:
-
-1. System packages and boot config (`cmdline.txt`, `config.txt`)
-2. USB Gadget setup (NCM on `usb0`)
-3. Anyone Protocol (`anon` package + `anonrc`)
-4. Node.js and Circuit Manager (`server.mjs` -> `/opt/anyone-stick/circuit-manager/`)
-5. Portal (`app.py` -> `/home/pi/portal/`)
-6. Shell scripts (`mode_normal.sh`, `mode_privacy.sh`, `anyone_killswitch.sh`, `start_anyone_stack.sh`)
-7. dnsmasq (DHCP for USB host)
-8. nginx (disabled - portal binds port 80 directly)
-9. Systemd services (enable all units)
-
-After installation the Pi reboots automatically.
-
-### 3 - Connect and use
-
-1. Plug the Pi into your computer via USB
-2. Wait ~60 seconds for boot
-3. Open **http://192.168.7.1** in your browser
-
-## Usage
-
-### Web Portal
-
-| Page | URL |
-|---|---|
-| Dashboard | `http://192.168.7.1/` |
-| Wi-Fi Settings | `http://192.168.7.1/wifi` |
+## Using the Dashboard
 
 ### Switching Modes
 
-- **Normal Mode** - standard internet via NAT (no privacy routing)
-- **Privacy Mode** - all TCP traffic transparently routed through `anon`; DNS via tunnel
+- **Normal Mode** = standard internet via NAT (no privacy routing)
+- **Privacy Mode** = all TCP traffic transparently routed through `anon`; DNS via tunnel
 
-Switch via the dashboard toggle. The kill switch activates automatically in Privacy Mode.
+Switch using the toggle on the dashboard. The kill switch activates automatically in Privacy Mode.
 
 ### Exit Country
 
@@ -120,68 +148,83 @@ Select a preferred exit country from the dropdown. The circuit manager rebuilds 
 
 ### 2-Hop vs 3-Hop
 
-- **2-Hop** - faster, lower latency (Guard -> Exit)
-- **3-Hop** - stronger anonymity (Guard -> Middle -> Exit)
-
-Switch via the dashboard. Requires circuit rebuild.
-
-## Repository Structure
-
-```
-Anyone-Stick/
-|- installer.sh                          # Main installer (9 sections)
-|- app.py                                # Flask portal -> /home/pi/portal/
-|- server.mjs                            # Circuit manager (Node.js) -> /opt/anyone-stick/circuit-manager/
-|- anonrc                                # anon config -> /etc/anonrc
-|- start_anyone_stack.sh                 # Boots anon + dnsmasq + mode
-|- mode_normal.sh                        # iptables for NAT mode
-|- mode_privacy.sh                       # iptables for transparent proxy mode
-|- anyone_killswitch.sh                  # FORWARD DROP leak prevention
-|- usb_gadget_setup.sh                   # NCM gadget on usb0
-|- cmdline.txt                           # Boot cmdline (dwc2 module)
-|- config.txt                            # Boot config (dwc2 overlay)
-|- anyone-stick.service                  # systemd: portal (gunicorn)
-|- anyone-stick-circuit-manager.service  # systemd: circuit manager (node)
-|- usb-gadget.service                    # systemd: USB gadget setup
-|- logo.png                              # Portal logo
-|- README.md                             # This file
-```
-
-## Systemd Services
-
-| Service | Description | Runs |
+| Mode | Path | Tradeoff |
 |---|---|---|
-| `usb-gadget` | Sets up NCM gadget on boot | once |
-| `anon` | Anyone relay daemon | always |
-| `anyone-stick-circuit-manager` | Node.js circuit manager sidecar (`:8787`) | always |
-| `anyone-stick` | Flask portal via gunicorn (`:80`) | always |
+| **2-Hop** | Guard -> Exit | Faster, lower latency |
+| **3-Hop** | Guard -> Middle -> Exit | Stronger anonymity |
 
-### Useful commands
+Switch via the dashboard. Requires a circuit rebuild (~30 seconds).
+
+---
+
+## Troubleshooting
+
+### "I plugged in the Pi but I cannot reach 192.168.7.1"
+
+1. **Check the cable** -- it must be a data cable, not charge-only. If in doubt, try a different cable.
+2. **Check the port** -- use the **data** USB port on the Pi (center), not the PWR port (edge).
+3. **Wait longer** -- the Pi Zero 2W takes ~60 seconds to fully boot.
+4. **Check your network settings** -- look for a new network interface (e.g., "RNDIS" on Windows, "USB Ethernet" on macOS/Linux). It should get a `192.168.7.x` IP via DHCP.
+5. **Windows users**: If the Pi shows up as a COM port instead of a network device, you may need to install RNDIS drivers or switch to NCM mode.
+
+### "Dashboard says Bootstrapping... and never finishes"
+
+- The Anyone network needs time to build circuits (typically 30-90 seconds after boot).
+- Check if `anon` is running: `ssh pi@192.168.7.1` then `sudo systemctl status anon`
+- Check circuit manager: `curl -s http://192.168.7.1:8787/status | jq .`
+
+### "Privacy Mode is on but websites do not load"
+
+- Some sites block known exit nodes. Try switching the exit country.
+- DNS may be slow on first use. Wait a few seconds and retry.
+- Check if anon has built a circuit: look for `circuitsCached > 0` in the dashboard.
+
+### "Wi-Fi lost after reboot"
+
+- SSH in via USB: `ssh pi@192.168.7.1`
+- Reconnect Wi-Fi: use the Wi-Fi page at `http://192.168.7.1/wifi` or via CLI:
+  ```bash
+  sudo nmcli dev wifi connect "YourSSID" password "YourPassword"
+  ```
+
+---
+
+## Useful Commands (via SSH)
 
 ```bash
-# Service status
-sudo systemctl status anyone-stick
-sudo systemctl status anyone-stick-circuit-manager
+# SSH into the Pi (via USB network)
+ssh pi@192.168.7.1
 
-# Logs
+# Service status
+sudo systemctl status anyone-stick                    # Portal
+sudo systemctl status anyone-stick-circuit-manager     # Circuit Manager
+sudo systemctl status anon                             # Anyone Protocol
+
+# Live logs
 sudo journalctl -u anyone-stick -f
 sudo journalctl -u anyone-stick-circuit-manager -f
+sudo journalctl -u anon -f
 
-# Circuit manager API (local)
+# Circuit manager API (from the Pi)
 curl -s http://127.0.0.1:8787/status | jq .
 curl -s http://127.0.0.1:8787/circuit | jq .
+
+# Restart everything
+sudo systemctl restart anon anyone-stick-circuit-manager anyone-stick
 ```
 
-## API Endpoints
+---
+
+## API Reference
 
 ### Portal (`:80`)
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/status` | Connection state, mode, circuits |
+| GET | `/api/status` | Connection state, mode, circuit count |
 | GET | `/api/cm/status` | Proxied circuit-manager status |
-| GET | `/api/anyone/proof` | Anyone network proof check |
-| POST | `/api/mode` | Switch Normal / Privacy |
+| GET | `/api/anyone/proof` | Anyone network connectivity proof |
+| POST | `/api/mode` | Switch between Normal / Privacy mode |
 | POST | `/api/country` | Set exit country |
 
 ### Circuit Manager (`:8787`)
@@ -193,6 +236,41 @@ curl -s http://127.0.0.1:8787/circuit | jq .
 | POST | `/country` | Set preferred exit country |
 | POST | `/newnym` | Request new identity (circuit rotation) |
 | GET | `/wait-ready` | Block until first circuit is BUILT |
+
+---
+
+## Repository Structure
+
+```
+Anyone-Stick/
++-- installer.sh                          # One-command installer (9 steps)
++-- app.py                                # Flask portal -> /home/pi/portal/
++-- server.mjs                            # Circuit manager (Node.js) -> /opt/anyone-stick/circuit-manager/
++-- anonrc                                # anon config -> /etc/anon/anonrc
++-- start_anyone_stack.sh                 # Boot script: anon + dnsmasq + mode
++-- mode_normal.sh                        # iptables rules for NAT mode
++-- mode_privacy.sh                       # iptables rules for transparent proxy
++-- anyone_killswitch.sh                  # FORWARD DROP leak prevention
++-- usb_gadget_setup.sh                   # NCM gadget setup on usb0
++-- cmdline.txt                           # Boot cmdline (dwc2 module)
++-- config.txt                            # Boot config (dwc2 overlay)
++-- anyone-stick.service                  # systemd: portal (gunicorn)
++-- anyone-stick-circuit-manager.service  # systemd: circuit manager (node)
++-- usb-gadget.service                    # systemd: USB gadget setup
++-- logo.png                              # Portal logo
++-- README.md                             # This file
+```
+
+## Systemd Services
+
+| Service | Description | Runs |
+|---|---|---|
+| `usb-gadget` | Sets up NCM gadget on boot | once |
+| `anon` | Anyone relay daemon | always |
+| `anyone-stick-circuit-manager` | Node.js circuit manager sidecar (`:8787`) | always |
+| `anyone-stick` | Flask portal via gunicorn (`:80`) | always |
+
+---
 
 ## License
 
