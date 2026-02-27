@@ -187,12 +187,31 @@ id debian-anon &>/dev/null || error "debian-anon user missing -- is the anon pac
 mkdir -p /etc/anon
 copy_file "anonrc" "/etc/anon/anonrc" 644
 
+# Ensure correct ownership of anon data + log directories
+chown -R debian-anon:debian-anon /var/lib/anon
 mkdir -p /var/log/anon
 chown debian-anon:debian-anon /var/log/anon
 
-# Enable anon at boot
+# Enable AND start anon now so control_auth_cookie is created
+# before circuit-manager's ExecStartPre checks for it
 systemctl enable anon
+systemctl start anon
+
+# Wait up to 30s for the cookie to appear
+log "Waiting for control_auth_cookie (max 30s)..."
+for i in $(seq 1 30); do
+  [[ -f /var/lib/anon/control_auth_cookie ]] && break
+  sleep 1
+done
+
+if [[ -f /var/lib/anon/control_auth_cookie ]]; then
+  ok "control_auth_cookie ready (${i}s)"
+else
+  warn "control_auth_cookie not found after 30s -- circuit-manager may fail until reboot"
+fi
+
 ok "anon configuration complete"
+
 
 # =============================================================================
 # 4 -- Node.js & Circuit Manager
