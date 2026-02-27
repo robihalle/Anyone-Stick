@@ -59,7 +59,7 @@ ssh pi@<your-pi-ip-address>
 
 # Install git and clone the repo
 sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/robihalle/Anyone-Stick.git
+git clone -b feature/2-hops https://github.com/robihalle/Anyone-Stick.git
 cd Anyone-Stick
 
 # Run the installer (takes ~10-15 minutes on Pi Zero 2W)
