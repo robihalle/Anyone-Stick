@@ -142,13 +142,35 @@ section "3/9 - Anyone Protocol (anon)"
 
 if ! command -v anon &>/dev/null; then
   log "Adding Anyone APT repository (official source)..."
+
+  # Load OS info
   . /etc/os-release
+
+  # The Anyone repo only publishes packages for stable Debian releases.
+  # If the system runs a newer/testing codename (e.g. trixie), fall back
+  # to bookworm -- the package is binary-compatible.
+  ANON_CODENAME="$VERSION_CODENAME"
+  SUPPORTED_CODENAMES=("bookworm" "bullseye")
+  IS_SUPPORTED=false
+  for c in "${SUPPORTED_CODENAMES[@]}"; do
+    [[ "$ANON_CODENAME" == "$c" ]] && IS_SUPPORTED=true && break
+  done
+
+  if [[ "$IS_SUPPORTED" == "false" ]]; then
+    warn "Distro codename '$ANON_CODENAME' is not supported by the Anyone repo."
+    warn "Falling back to 'bookworm' for anon package installation."
+    ANON_CODENAME="bookworm"
+  fi
+
+  log "Using anon repo suite: anon-live-${ANON_CODENAME}"
+
   wget -qO- https://deb.en.anyone.tech/anon.asc \
     | tee /etc/apt/trusted.gpg.d/anon.asc > /dev/null
-  echo "deb [signed-by=/etc/apt/trusted.gpg.d/anon.asc] https://deb.en.anyone.tech anon-live-${VERSION_CODENAME} main" \
+  echo "deb [signed-by=/etc/apt/trusted.gpg.d/anon.asc] https://deb.en.anyone.tech anon-live-${ANON_CODENAME} main" \
     | tee /etc/apt/sources.list.d/anon.list > /dev/null
   apt-get update -qq
-  apt-get install -y anon
+  apt-get install -y anon \
+    || error "Failed to install anon. Check if anon-live-${ANON_CODENAME} is a valid repo suite."
   ok "anon installed: $(anon --version 2>&1 | head -1)"
 else
   ok "anon already installed: $(anon --version 2>&1 | head -1)"
@@ -220,9 +242,6 @@ section "5/9 - Portal (Flask / Gunicorn)"
 
 mkdir -p "$PORTAL_DIR"
 copy_file "app.py" "$PORTAL_DIR/app.py" 644
-
-# Optional: deploy static folder if present in repo
-[[ -d "$SCRIPT_DIR/static" ]] && cp -r "$SCRIPT_DIR/static" "$PORTAL_DIR/"
 
 mkdir -p "$PORTAL_DIR/static"
 if [[ -f "$SCRIPT_DIR/logo.png" ]]; then
