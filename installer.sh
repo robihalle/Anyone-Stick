@@ -153,43 +153,39 @@ copy_file "usb_gadget_setup.sh"  "$BIN_DIR/usb_gadget_setup.sh"  755
 copy_file "usb-gadget.service"   "$SYSTEMD_DIR/usb-gadget.service" 644
 
 # =============================================================================
-# 3 -- Anyone Protocol (anon)
+# 3 — Anyone Protocol (anon)
 # =============================================================================
-section "3/9 - Anyone Protocol (anon)"
+section "3/9 · Anyone Protocol (anon)"
 
 if ! command -v anon &>/dev/null; then
   log "Adding Anyone APT repository (official source)..."
 
-  # Load OS info
-  . /etc/os-release
+  curl -fsSL https://deb.anyone.io/gpg.key \
+    | gpg --dearmor -o /usr/share/keyrings/anyone.gpg
 
-  # The Anyone repo only publishes packages for stable Debian releases.
-  # If the system runs a newer/testing codename (e.g. trixie), fall back
-  # to bookworm -- the package is binary-compatible.
-  ANON_CODENAME="$VERSION_CODENAME"
-  SUPPORTED_CODENAMES=("bookworm" "bullseye")
-  IS_SUPPORTED=false
-  for c in "${SUPPORTED_CODENAMES[@]}"; do
-    [[ "$ANON_CODENAME" == "$c" ]] && IS_SUPPORTED=true && break
-  done
-
-  if [[ "$IS_SUPPORTED" == "false" ]]; then
-    warn "Distro codename '$ANON_CODENAME' is not supported by the Anyone repo."
+  # Detect distro — fall back to bookworm if unsupported
+  DISTRO=$(lsb_release -cs 2>/dev/null || echo "bookworm")
+  ANON_SUITE="anon-live-${DISTRO}"
+  # Test if suite exists; fall back to bookworm
+  if ! curl -fsSL --head "https://deb.anyone.io/dists/${ANON_SUITE}/Release" &>/dev/null; then
+    warn "Distro codename '${DISTRO}' is not supported by the Anyone repo."
     warn "Falling back to 'bookworm' for anon package installation."
-    ANON_CODENAME="bookworm"
+    ANON_SUITE="anon-live-bookworm"
   fi
+  log "Using anon repo suite: ${ANON_SUITE}"
 
-  log "Using anon repo suite: anon-live-${ANON_CODENAME}"
+  echo "deb [signed-by=/usr/share/keyrings/anyone.gpg] https://deb.anyone.io ${ANON_SUITE} main" \
+    > /etc/apt/sources.list.d/anyone.list
 
-  wget -qO- https://deb.en.anyone.tech/anon.asc \
-    | tee /etc/apt/trusted.gpg.d/anon.asc > /dev/null
-  echo "deb [signed-by=/etc/apt/trusted.gpg.d/anon.asc] https://deb.en.anyone.tech anon-live-${ANON_CODENAME} main" \
-    | tee /etc/apt/sources.list.d/anon.list > /dev/null
   apt-get update -qq
-# Automatically accept anon terms and conditions (suppresses interactive debconf dialog)
-echo "anon anon/terms-and-conditions boolean true" | debconf-set-selections
-DEBIAN_FRONTEND=noninteractive apt-get install -y anon \
-  || error "Failed to install anon. Check if anon-live-${ANON_CODENAME} is a valid repo suite."
+
+  # Pre-accept the Anyone license agreement (required for non-interactive install)
+  export DEBIAN_FRONTEND=noninteractive
+  echo "anon anon/accepted-terms-and-conditions boolean true" \
+    | debconf-set-selections
+
+  apt-get install -y anon \
+    || error "Failed to install anon. Check if ${ANON_SUITE} is a valid repo suite."
 
   ok "anon installed: $(anon --version 2>&1 | head -1)"
 else
