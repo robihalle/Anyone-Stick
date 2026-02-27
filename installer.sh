@@ -146,11 +146,12 @@ copy_file "usb-gadget.service"   "$SYSTEMD_DIR/usb-gadget.service" 644
 section "3/9 - Anyone Protocol (anon)"
 
 if ! command -v anon &>/dev/null; then
-  log "Adding Anyone repository..."
-  curl -fsSL https://deb.anyone.io/gpg.key \
-    | gpg --dearmor -o /usr/share/keyrings/anyone.gpg
-  echo "deb [signed-by=/usr/share/keyrings/anyone.gpg] https://deb.anyone.io bookworm main" \
-    > /etc/apt/sources.list.d/anyone.list
+  log "Adding Anyone APT repository (official source)..."
+  . /etc/os-release
+  wget -qO- https://deb.en.anyone.tech/anon.asc \
+    | tee /etc/apt/trusted.gpg.d/anon.asc > /dev/null
+  echo "deb [signed-by=/etc/apt/trusted.gpg.d/anon.asc] https://deb.en.anyone.tech anon-live-${VERSION_CODENAME} main" \
+    | tee /etc/apt/sources.list.d/anon.list > /dev/null
   apt-get update -qq
   apt-get install -y anon
   ok "anon installed: $(anon --version 2>&1 | head -1)"
