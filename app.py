@@ -1870,6 +1870,7 @@ def api_mode_switch_status():
 @app.get("/api/status")
 def api_status():
     """Convenience alias – returns the same payload as /api/anyone/proof."""
+    return api_anyone_proof()
 
 
 
