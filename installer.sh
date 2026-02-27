@@ -169,8 +169,11 @@ if ! command -v anon &>/dev/null; then
   echo "deb [signed-by=/etc/apt/trusted.gpg.d/anon.asc] https://deb.en.anyone.tech anon-live-${ANON_CODENAME} main" \
     | tee /etc/apt/sources.list.d/anon.list > /dev/null
   apt-get update -qq
-  apt-get install -y anon \
-    || error "Failed to install anon. Check if anon-live-${ANON_CODENAME} is a valid repo suite."
+# Automatically accept anon terms and conditions (suppresses interactive debconf dialog)
+echo "anon anon/terms-and-conditions boolean true" | debconf-set-selections
+DEBIAN_FRONTEND=noninteractive apt-get install -y anon \
+  || error "Failed to install anon. Check if anon-live-${ANON_CODENAME} is a valid repo suite."
+
   ok "anon installed: $(anon --version 2>&1 | head -1)"
 else
   ok "anon already installed: $(anon --version 2>&1 | head -1)"
