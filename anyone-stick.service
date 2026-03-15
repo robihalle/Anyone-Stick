@@ -1,15 +1,17 @@
 [Unit]
 Description=Anyone Stick Master
-After=usb-gadget.service
-Requires=usb-gadget.service
+After=usb-gadget.service anon.service
+Requires=usb-gadget.service anon.service
 
 [Service]
+EnvironmentFile=-/etc/default/anyone-stick
 ExecStart=/usr/local/bin/start_anyone_stack.sh
 Restart=on-failure
 RestartSec=5
 User=root
+KillMode=control-group
 KillSignal=SIGINT
-TimeoutStopSec=10
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

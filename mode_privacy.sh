@@ -1,6 +1,6 @@
 #!/bin/bash
-# Anyone Stick — Privacy Mode (PREWARM -> FAST FLIP, LEAK-FREE)
-# Key: keep client online until we KNOW anon+circuits are ready, then flip iptables instantly.
+# Anyone Stick - Privacy Mode (PREWARM -> FAST FLIP, LEAK-FREE)
+# Key: keep client online until we KNOW anon+circuit-manager are ready, then flip iptables instantly.
 
 set -euo pipefail
 
@@ -46,9 +46,11 @@ is_listening_udp() {
 
 read_cookie_hex() {
   [ -r "$CTRL_COOKIE" ] || return 1
-  python3 - <<'PYC'
+  CTRL_COOKIE="$CTRL_COOKIE" python3 - <<'PYC'
 import binascii
-with open("/var/lib/anon/control_auth_cookie","rb") as f:
+import os
+path = os.environ["CTRL_COOKIE"]
+with open(path, "rb") as f:
     print(binascii.hexlify(f.read()).decode(), end="")
 PYC
 }
@@ -142,8 +144,9 @@ wait_cm_ready_and_circuit() {
 
 apply_leakfree_firewall() {
   log "Applying leak-free firewall (flip routing now)..."
-  # Ensure Anon DNSPort is live after any config/restart
-  pkill -HUP -f "/usr/local/bin/anon" 2>/dev/null; sleep 1
+
+  pkill -HUP -x anon 2>/dev/null || true
+  sleep 1
 
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   sysctl -w net.ipv4.conf."$IN_IF".route_localnet=1 >/dev/null 2>&1 || true
@@ -153,7 +156,6 @@ apply_leakfree_firewall() {
   iptables -t nat -F
   iptables -t mangle -F
 
-  # Disable IPv6 on stick (best-effort)
   sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
   sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
   sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
@@ -162,28 +164,20 @@ apply_leakfree_firewall() {
   iptables -P OUTPUT ACCEPT
   iptables -P FORWARD DROP
 
-  # DNS MUST come first — client uses Pi IP as DNS, so RETURN would swallow DNS queries!
   iptables -t nat -A PREROUTING -i "$IN_IF" -p udp --dport 53 -j DNAT --to-destination 127.0.0.1:"$DNS_PORT"
-
-  # Keep portal reachable (AFTER DNS rule so DNS gets DNAT'd through Anon)
   iptables -t nat -A PREROUTING -i "$IN_IF" -d "$PI_IP" -j RETURN
-
-  # All other TCP -> TransPort
   iptables -t nat -A PREROUTING -i "$IN_IF" -p tcp -j DNAT --to-destination 127.0.0.1:"$TRANS_PORT"
 
   iptables -A INPUT -i "$IN_IF" -p tcp --dport "$TRANS_PORT" -j ACCEPT
   iptables -A INPUT -i "$IN_IF" -p udp --dport "$DNS_PORT" -j ACCEPT
   iptables -A INPUT -i "$IN_IF" -p udp -j DROP
 
-  # NAT out
   iptables -A OUTPUT -o "$OUT_IF" -j ACCEPT
   iptables -t nat -A POSTROUTING -o "$OUT_IF" -j MASQUERADE
 
-  # TCP MSS clamp (avoid MTU blackholes)
   iptables -t mangle -A OUTPUT -o "$OUT_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
   iptables -t mangle -A POSTROUTING -o "$OUT_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
 
-  # IPv6: drop client IPv6 on usb0 to avoid AAAA blackhole
   ip6tables -P FORWARD DROP >/dev/null 2>&1 || true
   ip6tables -F >/dev/null 2>&1 || true
   ip6tables -t nat -F >/dev/null 2>&1 || true
@@ -194,9 +188,6 @@ apply_leakfree_firewall() {
   log "Leak-free firewall active."
 }
 
-# ──────────────────────────────────────────────
-# FAST-PATH: if already warm, flip immediately
-# ──────────────────────────────────────────────
 if cm_ready; then
   n="$(cm_hops_len || echo 0)"
   if [ "${n:-0}" -ge 2 ] && socks_verified; then
@@ -209,9 +200,6 @@ if cm_ready; then
   fi
 fi
 
-# ──────────────────────────────────────────────
-# PREWARM / VERIFY BEFORE FLIP (keeps client online while waiting)
-# ──────────────────────────────────────────────
 log "Prewarm: verifying anon + circuit-manager BEFORE flipping..."
 is_listening_tcp 127.0.0.1 "$TRANS_PORT"
 is_listening_tcp 127.0.0.1 "$SOCKS_PORT"
@@ -222,7 +210,6 @@ wait_bootstrap_100 120
 wait_socks_verified 40
 wait_cm_ready_and_circuit 25
 
-# Now flip instantly
 apply_leakfree_firewall
 date > "$PRIV_OK" 2>/dev/null || true
 log "OK: Privacy VERIFIED + routing active."

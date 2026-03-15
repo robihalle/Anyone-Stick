@@ -1,8 +1,9 @@
 [Unit]
-Description=USB Gadget Setup
+Description=USB Gadget Setup (NCM)
 DefaultDependencies=no
-After=sysinit.target
-Before=network.target anyone-stick.service
+After=local-fs.target sysinit.target systemd-modules-load.service
+Before=network-pre.target network.target anyone-stick.service
+Wants=systemd-modules-load.service
 
 [Service]
 Type=oneshot
@@ -10,4 +11,4 @@ ExecStart=/usr/local/bin/usb_gadget_setup.sh
 RemainAfterExit=yes
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=multi-user.target
