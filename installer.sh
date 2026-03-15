@@ -237,24 +237,8 @@ chown -R debian-anon:debian-anon /var/lib/anon
 mkdir -p /var/log/anon
 chown debian-anon:debian-anon /var/log/anon
 
-# Enable AND start anon now so control_auth_cookie is created
-# before circuit-manager's ExecStartPre checks for it
+# Enable anon now; the service itself will create its runtime state on boot.
 systemctl enable anon
-systemctl start anon
-
-# Wait up to 30s for the cookie to appear
-log "Waiting for control_auth_cookie (max 30s)..."
-for i in $(seq 1 30); do
-  [[ -f /var/lib/anon/control_auth_cookie ]] && break
-  sleep 1
-done
-
-if [[ -f /var/lib/anon/control_auth_cookie ]]; then
-  ok "control_auth_cookie ready (${i}s)"
-else
-  warn "control_auth_cookie not found after 30s — circuit-manager may fail until reboot"
-fi
-
 ok "anon configuration complete"
 
 # =============================================================================
@@ -288,10 +272,13 @@ PKGJSON
 
 log "Running npm install in circuit manager directory..."
 rm -rf "$CM_DIR/node_modules" "$CM_DIR/package-lock.json"
-cd "$CM_DIR" && npm install --omit=dev --no-fund --no-audit 2>&1 | tail -10
+cd "$CM_DIR" && npm install --omit=dev --no-fund --no-audit || error "npm install failed in $CM_DIR"
 cd - > /dev/null
 
-node --input-type=module -e "import * as Anyone from '@anyone-protocol/anyone-client'; const k = Object.keys(Anyone); if (!k.includes('StateManager') || !k.includes('VPNManager')) process.exit(1)"   && ok "anyone-client exports StateManager and VPNManager"   || error "Installed anyone-client package does not export StateManager/VPNManager"
+(
+  cd "$CM_DIR"
+  node --input-type=module -e "import * as Anyone from '@anyone-protocol/anyone-client'; const k = Object.keys(Anyone); if (!k.includes('StateManager') || !k.includes('VPNManager')) { console.error('Exports:', k.sort().join(', ')); process.exit(1); }"
+)   && ok "anyone-client exports StateManager and VPNManager"   || error "Installed anyone-client package does not export StateManager/VPNManager"
 
 # anon cache directory
 mkdir -p /root/.anon-cache
