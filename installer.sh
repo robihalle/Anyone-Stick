@@ -226,8 +226,11 @@ id debian-anon &>/dev/null \
 [[ -d /var/lib/anon ]] \
   || error "/var/lib/anon missing — is the anon package installed correctly?"
 
-# Deploy anonrc to /etc/ (not /etc/anon/)
-copy_file "anonrc" "/etc/anonrc" 644
+# Deploy anonrc to the path used by anon@default and keep /etc/anonrc as a compatibility symlink for the portal
+mkdir -p /etc/anon
+copy_file "anonrc" "/etc/anon/anonrc" 644
+ln -sfn /etc/anon/anonrc /etc/anonrc
+ok "Linked: /etc/anonrc -> /etc/anon/anonrc"
 
 # Ensure correct ownership of anon data + log directories
 chown -R debian-anon:debian-anon /var/lib/anon
@@ -278,14 +281,17 @@ cat > "$CM_DIR/package.json" << 'PKGJSON'
   "main": "server.mjs",
   "dependencies": {
     "express": "^4.18.2",
-    "@anyone-protocol/anyone-client": "latest"
+    "@anyone-protocol/anyone-client": "github:anyone-protocol/anon-protocol-npm#feature/vpn-state-manager"
   }
 }
 PKGJSON
 
 log "Running npm install in circuit manager directory..."
-cd "$CM_DIR" && npm install --omit=dev 2>&1 | tail -5
+rm -rf "$CM_DIR/node_modules" "$CM_DIR/package-lock.json"
+cd "$CM_DIR" && npm install --omit=dev --no-fund --no-audit 2>&1 | tail -10
 cd - > /dev/null
+
+node --input-type=module -e "import * as Anyone from '@anyone-protocol/anyone-client'; const k = Object.keys(Anyone); if (!k.includes('StateManager') || !k.includes('VPNManager')) process.exit(1)"   && ok "anyone-client exports StateManager and VPNManager"   || error "Installed anyone-client package does not export StateManager/VPNManager"
 
 # anon cache directory
 mkdir -p /root/.anon-cache

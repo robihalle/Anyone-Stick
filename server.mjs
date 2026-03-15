@@ -1850,7 +1850,6 @@ async function initManagersOnce() {
 
 async function bootstrapLoop() {
   _bootstrapStartedAt = Date.now();
-  _bootstrapStartedAt = Date.now();
   for (;;) {
     try {
       await initManagersOnce();
@@ -2205,17 +2204,6 @@ app.get("/rotation", (_req, res) => {
   });
 });
 
-app.get("/rotation", (_req, res) => {
-  res.json({
-    ok: true,
-    enabled: rotation.enabled,
-    intervalSeconds: rotation.intervalSeconds,
-    variancePercent: rotation.variancePercent,
-    nextRotationTs: _rotationNextTs || 0,
-    lastRotationTs: _rotationLastTs || 0,
-    privacy: _privacyModeActive(),
-  });
-});
 
 app.post("/rotation", (req, res) => {
   // Accept either top-level fields OR {rotation:{...}} (future-proof)
