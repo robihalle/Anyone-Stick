@@ -11,7 +11,8 @@ set -euo pipefail
 REPO_RAW="https://raw.githubusercontent.com/robihalle/Anyone-Stick/feature/2-hops"
 
 CM_DIR="/opt/anyone-stick/circuit-manager"
-PORTAL_DIR="/home/pi/portal"
+PRIMARY_USER="${SUDO_USER:-$(awk -F: '$3 == 1000 {print $1; exit}' /etc/passwd 2>/dev/null || true)}"
+PORTAL_DIR="/opt/anyone-stick/portal"
 BIN_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
 STATE_DIR="/var/lib/anyone-stick"
@@ -47,6 +48,8 @@ ok "Internet connection confirmed"
 # Script lives in repo root -- reference files relative to it
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log "Installer directory: $SCRIPT_DIR"
+[[ -n "${PRIMARY_USER:-}" ]] && log "Primary user: $PRIMARY_USER" || warn "Could not determine primary user; continuing as root"
+log "Portal directory: $PORTAL_DIR"
 
 # Helper: copy file from local repo OR download from remote
 copy_file() {
@@ -74,7 +77,7 @@ section "1/9 - System Packages"
 
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-  git curl wget \
+  git curl wget gnupg netcat-openbsd \
   python3 python3-pip python3-venv \
   network-manager dnsmasq \
   iptables iproute2 \
@@ -321,7 +324,12 @@ ok "Python dependencies installed"
 ln -sf "$PORTAL_DIR/venv/bin/gunicorn" /usr/local/bin/gunicorn
 ok "gunicorn symlinked -> /usr/local/bin/gunicorn"
 
-chown -R pi:pi "$PORTAL_DIR"
+if [[ -n "${PRIMARY_USER:-}" ]] && id "$PRIMARY_USER" >/dev/null 2>&1; then
+  chown -R "$PRIMARY_USER":"$PRIMARY_USER" "$PORTAL_DIR"
+  ok "Portal ownership set to ${PRIMARY_USER}:${PRIMARY_USER}"
+else
+  warn "Could not set portal ownership to a primary user; keeping current ownership"
+fi
 
 # =============================================================================
 # 6 -- Shell Scripts
@@ -329,13 +337,91 @@ chown -R pi:pi "$PORTAL_DIR"
 section "6/9 - Shell Scripts"
 
 for script in \
-  "start_anyone_stack.sh" \
   "mode_normal.sh" \
   "mode_privacy.sh" \
   "anyone_killswitch.sh"
 do
   copy_file "$script" "$BIN_DIR/$script" 755
 done
+
+cat > "$BIN_DIR/start_anyone_stack.sh" <<'STARTSCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+log() { echo "[boot] $*"; }
+
+PORTAL_DIR="/opt/anyone-stick/portal"
+if [[ ! -f "$PORTAL_DIR/app.py" && -f "/home/pi/portal/app.py" ]]; then
+  PORTAL_DIR="/home/pi/portal"
+fi
+
+if [[ -e /sys/class/leds/default-on/trigger ]]; then
+  echo timer > /sys/class/leds/default-on/trigger 2>/dev/null || true
+fi
+
+if [[ ! -f /var/lib/anyone-stick/privacy_verified ]]; then
+  if [[ -x /usr/local/bin/mode_normal.sh ]]; then
+    /usr/local/bin/mode_normal.sh >/dev/null 2>&1 || true
+  fi
+fi
+
+for i in $(seq 1 60); do
+  ip link show usb0 &>/dev/null && break
+  sleep 0.5
+done
+
+if ! ip link show usb0 &>/dev/null; then
+  log "ERROR: usb0 not found after 30s"
+  exit 1
+fi
+
+ip addr flush dev usb0 2>/dev/null || true
+ip addr add 192.168.7.1/24 dev usb0 2>/dev/null || true
+ip link set usb0 up
+systemctl restart dnsmasq
+log "usb0 configured and dnsmasq restarted"
+
+if [[ ! -f "$PORTAL_DIR/app.py" ]]; then
+  log "ERROR: portal app missing at $PORTAL_DIR/app.py"
+  exit 1
+fi
+
+pkill -f "gunicorn.*app:app" 2>/dev/null || true
+sleep 0.5
+
+if command -v gunicorn >/dev/null 2>&1; then
+  nohup gunicorn --bind 0.0.0.0:80     --workers 1     --threads 4     --timeout 0     --worker-class gthread     --chdir "$PORTAL_DIR"     app:app >/var/log/anyone-stick-gunicorn.log 2>&1 &
+elif [[ -x "$PORTAL_DIR/venv/bin/python" ]]; then
+  nohup "$PORTAL_DIR/venv/bin/python" "$PORTAL_DIR/app.py" >/var/log/anyone-stick-portal.log 2>&1 &
+else
+  nohup python3 "$PORTAL_DIR/app.py" >/var/log/anyone-stick-portal.log 2>&1 &
+fi
+log "portal started from $PORTAL_DIR"
+
+for i in $(seq 1 30); do
+  if nmcli -t -f STATE general 2>/dev/null | grep -q '^connected$'; then
+    log "NetworkManager reports connected"
+    break
+  fi
+  sleep 1
+done
+
+if [[ -f /var/lib/anyone-stick/privacy_verified ]]; then
+  log "Restoring PRIVACY mode"
+  if [[ -x /usr/local/bin/mode_privacy.sh ]]; then
+    nohup /usr/local/bin/mode_privacy.sh >/var/log/anyone-stick-privacy-restore.log 2>&1 &
+  fi
+else
+  log "Normal mode (no privacy marker)"
+  if [[ -x /usr/local/bin/anyone_killswitch.sh ]]; then
+    /usr/local/bin/anyone_killswitch.sh off >/dev/null 2>&1 || true
+  fi
+fi
+
+exec bash -c 'trap : TERM INT; while true; do sleep 3600; done'
+STARTSCRIPT
+chmod 755 "$BIN_DIR/start_anyone_stack.sh"
+ok "Deployed: $BIN_DIR/start_anyone_stack.sh"
 
 mkdir -p "$STATE_DIR"
 ok "State directory: $STATE_DIR"
