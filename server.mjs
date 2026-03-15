@@ -1168,13 +1168,18 @@ async function _refreshCircuitCache(){
       out = [];
     }
 
-    // 3) Accept READY as "built-like" too (vpn-state-manager often uses READY)
+    // 3) Accept READY / OPEN / ESTABLISH as "built-like" too.
+    // vpn-state-manager and fallback parsers do not always normalize to plain BUILT.
     out = out.filter(c => {
       const u = String(c?.status || "").toUpperCase();
-      // Per anon-protocol-npm reference (models.ts CircuitStatus):
-      // Valid states from GETINFO circuit-status are: LAUNCHED, BUILT, EXTENDED, FAILED, CLOSED
-      // Only BUILT means the circuit is ready for traffic.
-      return u === "BUILT" || u.startsWith("BUILT");
+      return (
+        u === "BUILT" ||
+        u.startsWith("BUILT") ||
+        u === "READY" ||
+        u.startsWith("READY") ||
+        u === "OPEN" ||
+        u.startsWith("ESTABLISH")
+      );
     });
 
     out.sort((a,b) => (a.first_seen_ts||0) - (b.first_seen_ts||0));
@@ -1321,6 +1326,14 @@ async function _fastBackgroundResolve() {
       console.error(`[fast-bg] Persisted ${Object.keys(out).length} entries to ${CACHE_FILE}`);
     } catch (e) {
       console.error("[fast-bg] Persist error:", e?.message || e);
+    }
+
+    // Rebuild relay index + circuit cache once country data is available.
+    try {
+      _refreshRelayIndex();
+      await _refreshCircuitCache();
+    } catch (e) {
+      console.error("[fast-bg] post-refresh error:", e?.message || e);
     }
 
   } catch (e) {
@@ -2290,7 +2303,7 @@ app.get("/wait-ready", async (req, res) => {
   const poll = async () => {
     while (Date.now() - start < timeoutMs) {
       try {
-        const circs = _cachedCircuits || [];
+        const circs = _cacheCircuits || [];
         const built = circs.filter(c => {
           const s = String(c?.status || "").toUpperCase();
           return s.startsWith("BUILT") || s.startsWith("READY") || s === "OPEN" || s.startsWith("ESTABLISH");
